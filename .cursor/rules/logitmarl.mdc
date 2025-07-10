@@ -1,0 +1,10 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Your rule content
+[instruction.md](mdc:instruction.md) 这是本项目的说明文档，在每次修改发生之前，先在说明文档中检查是否需要更新
+- You can @ files here
+- You can use markdown but dont have to

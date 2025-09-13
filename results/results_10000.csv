@@ -1,0 +1,5 @@
+method,raw_value,decayed_value,total_value,penalty
+NL-HMARL-AC,386,371,147,239
+NL-HMARL,6250,6170,5683,567
+Softmax,13638,13638,13638,0
+Softmax-AC,8692,8692,8692,0

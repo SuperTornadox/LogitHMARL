@@ -1,0 +1,49 @@
+{
+  "latex-workshop.latex.tools": [
+    {
+      "name": "latexmk",
+      "command": "latexmk",
+      "args": [
+        "-synctex=1",
+        "-interaction=nonstopmode",
+        "-file-line-error",
+        "-pdf",
+        "%DOC%"
+      ],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/Library/TeX/texbin:${env:PATH}"
+      }
+    }
+  ],
+  "latex-workshop.latex.recipes": [
+    {
+      "name": "latexmk (pdf)",
+      "tools": ["latexmk"]
+    }
+  ]
+}
+{
+    "latex-workshop.latex.tools": [
+      {
+        "name": "latexmk-xelatex",
+        "command": "latexmk",
+        "args": [
+          "-synctex=1",
+          "-interaction=nonstopmode",
+          "-file-line-error",
+          "-xelatex",
+          "-outdir=%OUTDIR%",
+          "%DOC%"
+        ],
+        "env": {
+          "PATH": "/Library/TeX/texbin:${env:PATH}"
+        }
+      }
+    ],
+    "latex-workshop.latex.recipes": [
+      { "name": "latexmk (xelatex)", "tools": ["latexmk-xelatex"] }
+    ],
+    "latex-workshop.view.pdf.viewer": "tab",
+    "latex-workshop.latex.autoBuild.run": "onSave"
+  }
+  

@@ -1,0 +1,373 @@
+\documentclass[journal,onecolumn]{IEEEtran}
+
+% ---------- 基础宏包 ----------
+\usepackage[utf8]{inputenc}      % 让 pdfLaTeX 正确处理 UTF-8
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{float}
+% (single-column) remove double-column float controls
+% \usepackage{dblfloatfix}
+\usepackage{placeins}
+% \usepackage{cuted}
+% ---- Float placement tuning (disabled in single-column) ----
+% \renewcommand{\dbltopfraction}{0.95}
+% \renewcommand{\textfraction}{0.05}
+% \renewcommand{\floatpagefraction}{0.9}
+% \renewcommand{\dblfloatpagefraction}{0.9}
+\usepackage{color,array,xspace}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{colortbl}
+\usepackage{parskip}            % 段落前后空白更友好
+\makeatletter
+\@ifundefined{labelindent}{}{\let\labelindent\relax}
+\makeatother
+\usepackage{enumitem}           % 自定义 enumerate 样式
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage[colorlinks,urlcolor=blue,linkcolor=blue,citecolor=blue]{hyperref}
+\usepackage[capitalise]{cleveref}
+
+\DeclareUnicodeCharacter{2009}{\,}         % U+2009 细空格 → LaTeX 细空格
+\DeclareUnicodeCharacter{2192}{$\rightarrow$} % U+2192 → 数学右箭头
+
+% ---------- 算法环境（任选其一；此处保留 algorithm2e） ----------
+\usepackage[linesnumberedhidden]{algorithm2e}
+%\usepackage{algorithm}
+%\usepackage{algpseudocode}
+
+
+\begin{document}
+\title{Nested-Logit Hierarchical MARL for Real-Time Task Allocation in Robotic Warehouses}
+\author{Xuchen He and Vijay K.~Madisetti}
+\maketitle
+
+\begin{abstract}
+We propose a nested-logit hierarchical multi-agent reinforcement learning (NL-HMARL) framework for real-time task allocation in robotic warehouses. The manager first selects a task nest and then a task within the chosen nest, capturing within-nest correlations while remaining end-to-end trainable. We formalise the problem, present policy and training objectives, provide an algorithm, and show that inference is linear in the number of tasks. A discrete-event simulator is used for evaluation against heuristics, flat MARL, and softmax-based HMARL.
+\end{abstract}
+
+\begin{IEEEkeywords}
+Warehouse automation; multi-agent reinforcement learning; nested logit; hierarchical RL; discrete-event simulation.
+\end{IEEEkeywords}
+
+\onecolumn
+
+\section{Introduction}
+\IEEEPARstart{G}{lobal} e‑commerce growth and ever‑shorter delivery promises have transformed large fulfilment centres into highly dynamic cyber–physical systems populated by hundreds of autonomous mobile robots (AMRs) and human pickers.%
+A central bottleneck in such environments is \emph{real‑time task allocation}: deciding which agent should execute which job (pick, move, recharge, etc.) so that throughput is maximised and congestion is avoided.%
+Formally, the problem couples (i) a stochastic arrival process of tasks, (ii) a spatially constrained routing domain, and (iii) resource conflicts such as narrow aisles and shared chargers.
+
+\vspace{2pt}
+\textbf{Limitations of existing approaches.} %
+Conventional rule‑based dispatchers or mixed‑integer programming formulations make strong assumptions about complete knowledge and often re‑optimise only at coarse time scales \citep{ratliff1983sshape,de_koster1997optimal}.%
+These methods struggle whenever tasks arrive continuously and system state changes faster than the optimiser can re‑solve.%
+More recent \emph{multi‑agent reinforcement learning} (MARL) removes handcrafted heuristics but suffers from the curse of dimensionality: flat MARL must explore a joint action space that grows exponentially with the number of agents and tasks \citep{alam2024dqn}.%
+Hierarchical MARL (HMARL) alleviates this by introducing a \emph{manager–worker} structure; however, most managers rely on a categorical policy that implicitly assumes \emph{independence of irrelevant alternatives (IIA)}.%
+When a high‑priority task appears in one zone, this assumption causes the manager to re‑weight \emph{all} alternatives—relevant or not—thereby increasing the risk of congestion and idle resources elsewhere.
+
+\vspace{2pt}
+\textbf{Motivating idea.} %
+To relax the IIA assumption while keeping the hierarchical decomposition, we consider equipping the high‑level manager with a \emph{Nested Logit} (NL) choice mechanism.%
+An NL structure first selects a \textit{nest}—for example, all pick tasks in Zone A or all charging jobs—then chooses a concrete task within that nest.%
+This two‑stage view preserves correlated alternatives within a nest and treats tasks in different nests as largely independent, matching the spatial and functional groupings observed in real warehouses.%
+Designing and learning such an NL‑HMARL architecture raises several open questions: how to define nests from raw warehouse state, how to integrate NL choice probabilities into reinforcement‑learning updates, and how to keep the overall decision loop fast enough for real‑time control.
+
+\vspace{2pt}
+\textbf{Scope of this paper.} %
+The remainder of this work focuses on formulating the NL‑HMARL framework, outlining its learning algorithm, and discussing how it interfaces with low‑level motion controllers.%
+Empirical evaluation and quantitative comparisons are ongoing and will be presented in future revisions; this manuscript restricts itself to problem definition, modelling choices, and methodological details.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+% ==========================================================
+\section{Background and Related Research}
+% ==========================================================
+
+Warehouse order-picking has become a showcase domain for multi-agent decision-making: dozens of autonomous mobile robots (AMRs) and human pickers must cooperate in narrow aisles while new orders arrive continuously.  The key challenge is \emph{real-time task allocation}—deciding \textit{who} should execute \textit{which} job so that throughput remains high and congestion is avoided.  Over the past four decades, researchers have offered solutions that range from handcrafted routing rules to learning-based dispatchers.  Table \ref{tab:comparison} gives a side-by-side comparison; the text below distils the main lines of work and their limitations.
+
+\subsection{Hand-crafted Routing Heuristics}
+Early warehouse studies proposed geometric heuristics such as \textbf{S-Shape}, \textbf{Return}, and \textbf{Largest-Gap} policies \citep{ratliff1983sshape}.  
+These methods chart deterministic picker paths—e.g.\ entering an aisle from one end and exiting the other—to guarantee full coverage with minimal computation.  
+\vspace{-2pt}
+\begin{itemize}[leftmargin=1.5em]
+  \item[] \textit{Pros:} millisecond execution, intuitive for practitioners.  
+  \item[] \textit{Cons:} assume tasks are independent; add extra walking when picks are sparse or aisles are dead-ends.
+\end{itemize}
+
+\subsection{Exact and Approximate OR Formulations}
+To move beyond single-picker rules, researchers turned to precise optimisation.  
+Exact \emph{TSP variants} find the absolute shortest tour but scale exponentially with pick points \citep{de_koster1997optimal}.  
+Approximate dynamic-programming schemes—e.g.\ partition-optimisation DP or accelerated SKU classification—strike a trade-off between solution quality and run-time \citep{saylam2022partition,rao2023accelerated}.  
+However, most OR models must be re-solved when new orders arrive, limiting real-time usability in large fulfilment centres.
+
+\subsection{Learning-based Single-Agent Methods}
+With the advent of deep RL, \textbf{DQN-style} agents have been trained to plan one step at a time on grid abstractions \citep{alam2024dqn}.  \\
+Such agents respond quickly but face an exploding joint action space when many robots act simultaneously.  \\
+Fine-grained policies also risk myopic oscillations because they lack a global task-assignment view.
+\\
+In this survey (and in our baselines), we include \emph{flat} non-hierarchical MARL under this category, as it selects low-level actions without a managerial layer; see Section~IV-C.
+
+\subsection{Hierarchical and Federated MARL}
+Hierarchical MARL (HMARL) splits the decision stack: a \emph{manager} allocates tasks, and \emph{worker} policies execute motions \citep{krnjaic2023hierarchical}.  \\
+Federated MARL extends this idea across multiple warehouses while keeping data local \citep{ho2024federated}.  \\
+Although sample-efficient, almost all high-level managers rely on a categorical soft-max choice, which embeds the \emph{independence-of-irrelevant-alternatives} (IIA) assumption—over-penalising unrelated options whenever one task’s utility changes.
+
+\subsection{Modelling Correlated Tasks}
+Operations-research literature models correlated choices with \textbf{Nested Logit} (NL) structures that group similar alternatives into “nests’’ \citep{train2009discrete}.  \\
+In warehouse contexts, NL has been applied mainly to static storage design; its integration into online MARL managers—especially with learnable nest dissimilarity parameters—remains unexplored.
+
+\FloatBarrier
+
+\subsection{Research Gap and Outlook}
+The survey above exposes three open issues: (i) real-time scalability once task arrivals grow dense, (ii) explicit modelling of correlation among tasks that share space or resources, and (iii) transparent, robust high-level decisions beyond a black-box soft-max.  \\
+The remainder of this paper proposes to embed an NL layer into the HMARL manager, yielding a two-stage \textit{choose-nest→choose-task} policy that learns both utility weights and nest dissimilarities while retaining end-to-end reinforcement-learning updates.
+
+\FloatBarrier
+\begin{figure}[H]
+  \centering
+  \renewcommand{\arraystretch}{1.2}
+  \begin{minipage}[t]{0.47\textwidth}
+    \centering
+    \textbf{Conventional HMARL (softmax manager)}\\[4pt]
+    \fbox{\strut Manager: softmax over all tasks} $\Rightarrow$ \\
+    \fbox{\strut Select task $i$}
+  \end{minipage}\hfill
+  \begin{minipage}[t]{0.47\textwidth}
+    \centering
+    \textbf{Proposed NL-HMARL (nest→task)}\\[4pt]
+    \fbox{\strut Manager: Nested Logit} $\Rightarrow$ \\
+    \fbox{\strut Select nest $m$} $\Rightarrow$ \\
+    \fbox{\strut Within $\mathcal{N}^m$: softmax with $\eta_m$} $\Rightarrow$ \\
+    \fbox{\strut Select task $i\in\mathcal{N}^m$}
+  \end{minipage}
+  \caption{Conceptual difference between conventional HMARL and the proposed NL-HMARL at the manager layer: NL first chooses a nest (capturing within-nest correlation via $\eta_m$) and then a task within that nest.}
+  \label{fig:nl_vs_hmarl}
+\end{figure}
+\FloatBarrier
+
+
+\begin{table}[!t]
+  \centering
+  \caption{Comprehensive comparison of routing and learning methods for warehouse order-picking task allocation}
+  \label{tab:comparison}
+  \renewcommand{\arraystretch}{1.10}
+  \resizebox{\textwidth}{!}{%
+  % -------------- 2 ⟶ tabular ------------------
+  \begin{tabular}{p{2.7cm}p{4.9cm}p{3.2cm}p{4.8cm}p{3.8cm}p{4.2cm}p{2.8cm}}
+    \toprule
+      \textbf{Method} & \textbf{Focus} & \textbf{Reference} & \textbf{Approach} &
+      \textbf{Key Benefit} & \textbf{Limitations} &
+      \textbf{Computational Complexity} \\
+    \midrule
+      S-Shape Routing Policy &
+      Systematically traverses aisles with pick tasks using a predefined S-shaped (or Z-shaped) path to ensure every pick location is covered. &
+      Ratliff and Rosenthal \citep{ratliff1983sshape}. &
+      Picker enters an aisle at one end, picks along the way, exits at the other end (for through aisles), then moves to the next aisle in S-shape order. &
+      Simple, intuitive, ensures full aisle coverage; most efficient when picks are densely distributed. &
+      Adds unnecessary walking if an aisle has few picks (especially near its entrance) or is a dead-end. &
+      Low -- $O(P\log P)$ \\[2pt]
+
+      Return Routing Policy &
+      Picks all items in an aisle by entering and exiting from the same end. &
+      Widely discussed heuristic; no specific origin. &
+      Picker enters an aisle, walks to the furthest pick, then returns and leaves from the same end. &
+      Ideal for dead-end aisles or when picks cluster near the entrance of long aisles, avoiding full traversal. &
+      Less efficient when picks are spread throughout the aisle or when aisles are bidirectional, because it always includes a round-trip. &
+      Low -- $O(P\log P)$ \\[2pt]
+
+      Optimal Routing Procedure &
+      Finds the absolutely shortest path or minimum time to visit all order items. &
+      De Koster and Van der Poort \citep{de_koster1997optimal}. &
+      Models the problem as a TSP variant or uses dynamic programming, considering all pick points and constraints. &
+      Guarantees the shortest pick path, minimising travel distance. &
+      Very high computation cost for many pick points or complex layouts, hindering real-time use. &
+      Very High -- $O(n^{2}\!\cdot\!2^{n})$ \\[2pt]
+
+      \\
+
+      Largest Gap Routing Policy &
+      Minimises walking by allowing bidirectional traversal and exiting the aisle at the end closest to the next pick. &
+      De Koster and Van der Poort \citep{de_koster1997optimal}. &
+      Picker walks to the furthest pick, then exits at the nearer aisle end. &
+      More efficient than one-way traversals when aisles are open at both ends and picks are dispersed. &
+      Requires both aisle ends open; performance degrades when picks cluster at one end; less intuitive. &
+      Low -- $O(P\log P)$ \\[2pt]
+
+      \\
+
+      Partition-Optimisation Dynamic Programming &
+      Minimises the latest zone completion time in synchronised dynamic zone picking. &
+      Saylam, Çelik and Süral \citep{saylam2022partition} &
+      DP enumerates adjacent zone boundaries to solve a min-max objective. &
+      Balances workload and eases bottlenecks. &
+      Computation grows quickly with more zones; limited real-time adaptability. &
+      Medium -- $O(K\!\cdot\!Q)$ (pseudo-polynomial) \\[2pt]
+
+      Accelerated Storage Classification Algorithm &
+      SKU class partitioning and space sharing based on turnover rate. &
+      Rao and Adil \citep{rao2023accelerated} &
+      Pruned dynamic programming that skips dominated partitions. &
+      10--50 $\times$ faster than traditional DP while retaining optimality. &
+      Relies on accurate demand forecasts; used as an off-line design tool. &
+      Medium -- $O(K\!\cdot\!C)$ (pseudo-polynomial) \\[2pt]
+
+      Deep Q-Network (DQN) &
+      Real-time multi-robot path planning and congestion management. &
+      Alam, Khan and Gunes \citep{alam2024dqn} &
+      Grid-state DQN chooses the next action with rewards penalising collisions. &
+      Millisecond-level decisions; greatly reduces deadlocks. &
+      Requires large training data sets; sensitive to layout changes. &
+      Training: High $O(E\!\cdot\!T)$; Inference: Low $O(1)$ \\[2pt]
+
+      Federated Deep Reinforcement Learning &
+      Privacy-preserving task scheduling across multiple warehouses. &
+      Ho, Nguyen and Cheriet \citep{ho2024federated} &
+      Federated PPO with local training and central model aggregation. &
+      Keeps data local; supports heterogeneous warehouses; shares experience. &
+      Communication overhead; slower convergence than centralised learning. &
+      Training: High $O(E\!\cdot\!T\!\cdot\!A)+O(R\!\cdot\!B)$; Inference: Low $O(A)$ \\[2pt]
+
+      Hierarchical Multi-Agent Reinforcement Learning &
+      Task scheduling for multi-robot and human collaboration. &
+      Krnjaic et al.\ \citep{krnjaic2023hierarchical} &
+      Manager–worker MARL with centralised training and distributed execution. &
+      Adapts to varied layouts, delivers high pick rates, is sample-efficient. &
+      High training compute needs; requires stable communication. &
+      Training: High $O(E\!\cdot\!T\!\cdot\!A)$; Inference: Low $O(A)$ \\[2pt]
+    \bottomrule
+  \end{tabular}}
+\end{table}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+% Removed forced page break to preserve section order
+% ==========================================================
+\section{Proposed Method}
+% ==========================================================
+
+\subsection{Problem Formulation}
+We consider a large robotic warehouse with a set of autonomous mobile robots (AMRs) and a stream of tasks that arrive online (picking, replenishment, charging, inspection). Let \(t\in\{0,1,\dots\}\) index decision epochs. The warehouse state is denoted by \(s_t\), which aggregates: (i) robot kinematics and battery levels, (ii) the current task pool \(\mathcal{T}_t=\{\tau^1_t,\dots,\tau^{A_t}_t\}\) with spatial locations and priorities, and (iii) layout and resource status (aisle occupancy, charger queues). We write \(A_t=|\mathcal{T}_t|\) for the number of available tasks and group tasks into a set of nests \(\mathcal{G}_t=\{\mathcal{N}^1_t,\dots,\mathcal{N}^{G_t}_t\}\), where each nest captures a correlated subset (e.g., all picks in a zone, all charging jobs).
+
+We adopt a hierarchical control scheme: a high-level manager chooses a task for each robot (or chooses \textsc{idle}) and low-level worker policies execute motion actions. Let the manager’s decision at time \(t\) be the selection of a nest \(m_t\in\{1,\dots,G_t\}\) followed by a task \(i_t\in\mathcal{N}^{m_t}_t\). Each robot \(k\) then follows a worker policy \(\pi_\omega(\cdot\mid o^k_t, i_t)\) that maps local observation \(o^k_t\) and the assigned task to low-level actions. The environment returns a scalar reward \(r_t\) that balances throughput, lateness penalties, path-length, energy usage, collisions and deadlocks.
+
+Our objective is to maximise the expected discounted return
+\[ J(\theta,\phi,\lambda,\omega,\psi)\;=\;\mathbb{E}\Big[\sum_{t=0}^{\infty} \gamma^t\, r_t\Big], \]
+where \(\gamma\in(0,1)\) and \((\theta,\phi,\lambda)\) parameterise the manager policy, \(\omega\) the worker policies, and \(\psi\) the critic/baseline used for variance reduction.
+
+\subsection{Nested-Logit Hierarchical Architecture}
+To relax the independence-of-irrelevant-alternatives assumption while remaining fully differentiable, we equip the manager with a Nested-Logit (NL) two-stage policy \citep{mcfadden1978residential,benakiva1985dca,train2009discrete}.
+
+\paragraph{Task utilities and nest dissimilarities.} For every candidate task \(i\in\mathcal{T}_t\) we define a learnable utility
+\[ u_i\,=\,u_\theta(s_t, i) \in \mathbb{R}, \]
+and for each nest \(m\) a learnable dissimilarity parameter \(\eta_m\in(0,1]\). We parameterise \(\eta_m=\sigma(\lambda_m)\) via a sigmoid to ensure the correct range and learn \(\lambda_m\in\mathbb{R}.\) Define the nest inclusive value
+\[ I_m\,=\,\log \sum_{j\in\mathcal{N}^m_t} \exp\!\big(\tfrac{u_j}{\eta_m}\big). \]
+
+\paragraph{Two-stage manager policy.} We introduce a nest-level score \(b_m=b_\phi(s_t,m)\). Concretely, let a per-task embedding be \(\mathbf{z}_j = \psi(s_t,j) \in \mathbb{R}^{d_z}\) and a global context embedding be \(\mathbf{g}_t = \rho(s_t) \in \mathbb{R}^{d_g}\). We obtain a nest pooling by
+\[ \mathbf{p}_m\;=\;\big[\,\mathrm{mean}_{j\in\mathcal{N}^m_t}\, \mathbf{z}_j\;;\;\mathrm{max}_{j\in\mathcal{N}^m_t}\, \mathbf{z}_j\,\big] \in \mathbb{R}^{2d_z}, \]
+and form the scorer input by concatenation with a learnable nest identifier embedding \(\mathbf{e}^{\mathrm{id}}_m\):
+\[ \mathbf{x}_m\;=\;\mathrm{concat}\big(\mathbf{g}_t,\; \mathbf{e}^{\mathrm{id}}_m,\; \mathbf{p}_m,\; |\mathcal{N}^m_t|\big). \]
+The nest score is then computed by a two-layer MLP:
+\[ b_m\;=\;\mathrm{MLP}_{\phi}(\mathbf{x}_m). \]
+As an attention alternative, one may use weights \(\alpha_{mj}=\mathrm{softmax}_j(\mathbf{q}_m^{\top}\,\mathbf{W}\,\mathbf{z}_j)\) and set \(\mathbf{p}_m=\sum_{j\in\mathcal{N}^m_t}\alpha_{mj}\,\mathbf{z}_j\). The NL manager then first samples a nest and subsequently a task within it with probabilities
+\[ \pi_{\mathrm{nest}}(m\mid s_t)\;=\;\frac{\exp\big(b_m + \eta_m I_m\big)}{\sum_{n} \exp\big(b_n + \eta_n I_n\big)}, \]
+\[ \pi_{\mathrm{task}}(i\mid s_t,m)\;=\;\frac{\exp\big( u_i/\eta_m \big)}{\sum_{j\in\mathcal{N}^m_t} \exp\big( u_j/\eta_m \big)}. \]
+The joint manager probability for selecting task \(i\) is then
+\[ \pi_{\mathrm{M}}(i\mid s_t)\;=\;\sum_{m:\, i\in\mathcal{N}^m_t} \pi_{\mathrm{nest}}(m\mid s_t)\, \pi_{\mathrm{task}}(i\mid s_t,m). \]
+This structure captures correlation among alternatives inside a nest via \(\eta_m\) while keeping tasks in different nests largely independent.
+
+\paragraph{Workers.} Given an assigned task \(i_t\), worker policies \(\pi_\omega(\cdot\mid o^k_t, i_t)\) produce motion-level actions until termination (success, failure, or abort), at which point control returns to the manager for reallocation. Workers are trained with shaped rewards that encourage progress along feasible, collision-free paths, and can be interpreted through the options framework for temporal abstraction \citep{sutton1999options}.
+
+\subsection{Policy Representation and Learning}
+We adopt an actor–critic objective with entropy regularisation \citep{suttonbarto2018}. Writing \(A_t = R_t - V_\psi(s_t)\) for the advantage and \(R_t\) for an \(n\)-step or GAE return \citep{schulman2016gae}, the manager’s log-probability factorises as
+\[ \log \pi_{\mathrm{M}}(i_t\mid s_t)\;=\; \log \pi_{\mathrm{nest}}(m_t\mid s_t)\; +\; \log \pi_{\mathrm{task}}(i_t\mid s_t,m_t). \]
+The manager loss is
+\begin{equation}
+\begin{aligned}
+\mathcal{L}_{\mathrm{M}}(\theta,\phi,\lambda)
+&= -\,\mathbb{E}\!\left[ A_t\, \log \pi_{\mathrm{M}}(i_t\mid s_t) \right] \\
+&\quad -\, \beta_{\mathrm{H}}\, H\!\left[\pi_{\mathrm{nest}}(\cdot\mid s_t)\right] \\
+&\quad -\, \beta_{\mathrm{H}}\, \sum_m H\!\left[\pi_{\mathrm{task}}(\cdot\mid s_t,m)\right].
+\end{aligned}
+\end{equation}
+with entropy weight \(\beta_{\mathrm{H}}\). The critic minimises \(\mathcal{L}_{\mathrm{V}}(\psi) = \mathbb{E}[ (R_t - V_\psi(s_t))^2 ]\). Worker policies minimise the standard actor–critic loss conditioned on the assigned task.
+
+All parameters \(\{\theta,\phi,\lambda,\omega,\psi\}\) are updated by stochastic gradient descent/ascent on the combined loss. The NL components are fully differentiable; gradients flow through \(I_m\), \(\eta_m\) and the log-probabilities. For numerical stability we clip \(\eta_m\in[\eta_{\min},1]\) with \(\eta_{\min}\approx 0.1\).
+For the training schedule and implementation details of the optimisation loop, please refer to Section~IV (Training Protocol).
+
+% Moved to Section IV (Training Protocol)
+% Training details and the full optimisation loop are provided in Section~IV (Training Protocol).
+
+\subsection{Properties and Theoretical Analysis}
+\textbf{End-to-end differentiability and correlation modelling.} The NL factorisation keeps the full pipeline differentiable while allowing \(\eta_m\in(0,1]\) to capture within-nest correlation. When \(\eta_m\to 1\), the model approaches a soft-max over all tasks; smaller \(\eta_m\) increases within-nest substitution and reduces cross-nest interference.
+
+\textbf{Real-time complexity.} Let \(A=|\mathcal{T}_t|\) and \(G=|\mathcal{G}_t|\). One decision requires: computing utilities \(u_i\) in \(O(A)\); computing \(I_m\) as a single pass over tasks grouped by nests in \(O(A)\); and forming nest logits in \(O(G)\). Thus the overall inference complexity is \(O(A)\). With moderate batching and caching of features shared by tasks in the same zone, wall-clock latency remains compatible with millisecond-level dispatching.
+
+\textbf{Robustness and stability.} By re-weighting only alternatives in the selected nest at the second stage, the manager becomes less sensitive to unrelated high-utility outliers elsewhere in the warehouse, improving stability under bursty arrivals. Entropy on both nesting and within-nest choices prevents premature collapse to a single region and encourages exploration early in training.
+
+% ==========================================================
+\section{Experimental Setup}
+% ==========================================================
+
+\subsection{Simulation Environment}
+We employ a discrete-event warehouse simulator that captures order arrivals, robot kinematics, aisle congestion, charging constraints, and station service times. Unless otherwise noted, the default configuration uses: 64 autonomous mobile robots (AMRs), 8 picking stations, 4 charging pads, and a grid layout with two cross-aisles and 24 storage aisles. Orders arrive according to a nonhomogeneous Poisson process with hour-of-day variations (peak/off-peak multipliers 1.6/0.7). Each order is decomposed into pick tasks with item locations sampled from a heatmap fitted to typical turnover profiles. Task nests are formed online by spatial zones (quadrants × aisle ranges) and task type (pick vs.\ charge).
+
+Robots obey simple differential-drive dynamics with max speed 1.2\,m/s and rely on the worker layer for local collision avoidance. Charging takes 15\,min from 20\% to 80\% state of charge. The manager replans every 2\,s or upon early task termination. Each episode lasts 1 simulated hour; we report averages over 32 seeds.
+
+\subsection{Evaluation Metrics}
+We evaluate policies with standard throughput and responsiveness metrics:
+\begin{itemize}[leftmargin=1.5em]
+  \item Order throughput (orders/hour) and task completion rate (\%).
+  \item Mean task waiting time and 95\% tail latency (seconds).
+  \item Congestion time (seconds within proximity threshold).
+  \item Episode return (undiscounted cumulative reward) and safety violations (near-collisions per hour).
+\end{itemize}
+We additionally report per-zone balance (coefficient of variation of queue lengths) to quantify spatial load smoothing.
+
+\subsection{Baselines}
+We compare NL-HMARL against:
+\begin{itemize}[leftmargin=1.5em]
+  \item Rule-based heuristics: S-Shape and Return routing \citep{ratliff1983sshape} with greedy assignment.
+  \item Optimal Routing Procedure (TSP/DP) \citep{de_koster1997optimal}: finds shortest tour/time under exact/DP formulations.
+  \item Flat MARL: a single centralized policy selecting robots' actions without hierarchy \citep{alam2024dqn}.
+  \item Hierarchical MARL with softmax manager: identical to ours but replacing the NL with a categorical softmax over tasks.
+\end{itemize}
+Baselines are tuned by grid search on learning rate and entropy weight and trained for the same number of environment steps.
+
+\subsection{Implementation Details}
+Managers use two-layer MLPs (hidden sizes 256/128) for utility and nest scorers; \(\eta_m=\sigma(\lambda_m)\) with initial \(\lambda_m=0\). Workers share a policy with Task-Conditioned inputs (task pose and type embedding). We train with Adam (manager/critic/worker lr = \(3\times10^{-4}/3\times10^{-4}/2\times10^{-4}\)), entropy weight \(\beta_{\mathrm{H}}=0.01\), discount \(\gamma=0.99\), GAE \(\lambda=0.95\), minibatch size 4096 transitions, and target KL early-stop at 0.02. Pilot runs use 5 million environment steps on a single machine; full runs use 20 million steps for the reported results. Nests are recomputed every manager decision with zone caches.
+
+Pilot experiments run locally on a MacBook Pro (M1 Pro) with PyTorch MPS enabled; full-scale training runs on Google Colab with an A100 GPU. The simulator is CPU-bound; wall-clock time scales primarily with CPU throughput. Hyperparameter sensitivity is provided in the appendix.
+
+\subsection{Training Protocol}
+For completeness, we summarise the training procedure used in our experiments. The protocol follows standard actor--critic practice with GAE and entropy regularisation; manager updates are performed at the task-allocation time scale, while workers are trained at the motion-control time scale. Unless otherwise stated, we use the hyperparameters in \S\,IV-D. The full pseudocode is provided at the end of this section (Algorithm~\ref{alg:nl-hmarl}).
+
+% removed forced page break/barrier to allow natural placement within the page
+\begin{algorithm}[!htbp]
+  \caption{Training NL-HMARL with Actor--Critic}
+  \label{alg:nl-hmarl}
+  \DontPrintSemicolon
+  \SetKwInOut{Input}{Input}
+  \SetKwInOut{Output}{Output}
+  \Input{Environment \(\mathcal{E}\); discount \(\gamma\); entropy weight \(\beta_{\mathrm{H}}\); learning rates.}
+  \Output{Parameters \(\theta,\phi,\lambda\) (manager), \(\omega\) (workers), \(\psi\) (critic).}
+  \BlankLine
+  Randomly initialise \(\theta,\phi,\lambda,\omega,\psi\).\;
+  \For{each training iteration}{
+    Roll out trajectories for horizon \(T\) in \(\mathcal{E}\):\;
+    \For{$t=0$ \KwTo $T-1$}{
+      Observe \(s_t\); build nests \(\{\mathcal{N}^m_t\}\).\;
+      Compute task utilities \(u_i=u_\theta(s_t,i)\) and inclusive values \(I_m\).\;
+      Sample nest \(m_t\sim \pi_{\mathrm{nest}}(\cdot\mid s_t)\); then task \(i_t\sim \pi_{\mathrm{task}}(\cdot\mid s_t,m_t)\).\;
+      Assign \(i_t\) to an available robot; execute workers \(\pi_\omega(\cdot\mid o^k_t,i_t)\) until termination; collect reward \(r_t\).\;
+      Store \((s_t, m_t, i_t, r_t, s_{t+1})\).\;
+    }
+    Compute returns \(R_t\) and advantages \(A_t=R_t-V_\psi(s_t)\).\;
+    Update manager by descending \(\nabla_{\theta,\phi,\lambda} \mathcal{L}_{\mathrm{M}}\).\;
+    Update workers by actor--critic gradients conditioned on assigned tasks.\;
+    Update critic by descending \(\nabla_{\psi} \mathcal{L}_{\mathrm{V}}\).\;
+  }
+\end{algorithm}
+
+\bibliographystyle{IEEEtranN}
+\bibliography{refs}
+\end{document}

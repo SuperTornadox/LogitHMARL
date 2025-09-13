@@ -1,0 +1,16 @@
+# Core scientific stack
+numpy
+scipy
+pandas
+
+# Deep learning
+torch
+
+# Visualization and plotting
+matplotlib
+tqdm
+
+# Media export for animations
+pillow
+imageio
+imageio-ffmpeg

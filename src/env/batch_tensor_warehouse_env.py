@@ -98,6 +98,11 @@ class BatchTensorWarehouseEnv:
         self.total_value_completed = None  # (B,) float
 
         self.reset()
+        # Cached tensors from last step for fast tensor I/O
+        self.last_rewards = None        # (B,N) float
+        self.last_dones = None          # (B,N) float
+        self.last_step_reward = None    # (B,) float
+        self.last_next_state = None     # (B,S) float
 
     def _build_layout(self):
         B, H, W, S = self.B, self.H, self.W, self.S
@@ -547,16 +552,22 @@ class BatchTensorWarehouseEnv:
         self.current_time += self.time_step / 3600.0
         self.current_step += 1
 
-        outs: List[Dict[str, Any]] = []
+        # Cache tensor outputs
         st_vec = self.get_state_vec()  # (B,S)
         done_b = (self.current_step >= self.max_steps)
+        self.last_rewards = rewards.detach().clone()
+        self.last_dones = done_b.view(B, 1).float().expand(B, N).detach().clone()
+        self.last_step_reward = rewards.sum(dim=1).detach().clone()
+        self.last_next_state = st_vec.detach().clone()
+
+        # Backward-compatible numpy list-of-dict for existing callers
+        outs: List[Dict[str, Any]] = []
         for b in range(B):
             outs.append({
-                'step_reward': float(rewards[b].sum().item()),
-                'next_state_vec': st_vec[b].detach().cpu().numpy().astype('float32'),
-                'rewards_vec': rewards[b].detach().cpu().numpy().astype('float32'),
-                'dones_vec': (torch.full((self.N,), float(done_b[b].item()), device=self.device)
-                              .cpu().numpy().astype('float32')),
+                'step_reward': float(self.last_step_reward[b].item()),
+                'next_state_vec': self.last_next_state[b].cpu().numpy().astype('float32'),
+                'rewards_vec': self.last_rewards[b].cpu().numpy().astype('float32'),
+                'dones_vec': self.last_dones[b].cpu().numpy().astype('float32'),
             })
         return outs
 
@@ -666,15 +677,20 @@ class BatchTensorWarehouseEnv:
         self.current_time += self.time_step / 3600.0
         self.current_step += 1
 
-        outs: List[Dict[str, Any]] = []
+        # Cache tensor outputs
         st_vec = self.get_state_vec()
         done_b = (self.current_step >= self.max_steps)
+        self.last_rewards = rewards.detach().clone()
+        self.last_dones = done_b.view(B, 1).float().expand(B, N).detach().clone()
+        self.last_step_reward = rewards.sum(dim=1).detach().clone()
+        self.last_next_state = st_vec.detach().clone()
+
+        outs: List[Dict[str, Any]] = []
         for b in range(B):
             outs.append({
-                'step_reward': float(rewards[b].sum().item()),
-                'next_state_vec': st_vec[b].detach().cpu().numpy().astype('float32'),
-                'rewards_vec': rewards[b].detach().cpu().numpy().astype('float32'),
-                'dones_vec': (torch.full((self.N,), float(done_b[b].item()), device=self.device)
-                              .cpu().numpy().astype('float32')),
+                'step_reward': float(self.last_step_reward[b].item()),
+                'next_state_vec': self.last_next_state[b].cpu().numpy().astype('float32'),
+                'rewards_vec': self.last_rewards[b].cpu().numpy().astype('float32'),
+                'dones_vec': self.last_dones[b].cpu().numpy().astype('float32'),
             })
         return outs

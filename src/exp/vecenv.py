@@ -280,6 +280,8 @@ class SubprocVecEnv:
     def __init__(self, n_envs: int, env_config: Dict[str, Any], max_tasks: int):
         self.n = int(max(1, n_envs))
         self.max_tasks = int(max_tasks)
+        self.N = int(env_config.get('n_pickers', 1))
+        self.env_config = dict(env_config)
         self.parent_conns: List[Connection] = []
         self.procs: List[mp.Process] = []
         ctx = mp.get_context('spawn')
@@ -324,6 +326,109 @@ class SubprocVecEnv:
             pc.send(('worker_obs', include_global))
         outs = [pc.recv() for pc in self.parent_conns]
         return outs
+
+    # -------- Batched tensor helpers (collate subprocess results into torch tensors) --------
+    def get_features_tensor(self, device: str = 'cpu') -> Dict[str, 'torch.Tensor']:
+        import torch
+        outs = self.get_features()
+        B = len(outs)
+        # Infer shapes
+        S = int(outs[0]['state_vec'].shape[0]) if B > 0 else 0
+        T = int(outs[0]['task_feats'].shape[0]) if B > 0 else self.max_tasks
+        N = self.N
+        state = torch.zeros((B, S), dtype=torch.float32)
+        task_feats = torch.zeros((B, T, outs[0]['task_feats'].shape[1] if B>0 else 5), dtype=torch.float32)
+        task_mask = torch.zeros((B, T), dtype=torch.bool)
+        nest_ids = torch.zeros((B, T), dtype=torch.long)
+        free_mask = torch.zeros((B, N), dtype=torch.bool)
+        for b, f in enumerate(outs):
+            sv = torch.as_tensor(f['state_vec'], dtype=torch.float32)
+            tf = torch.as_tensor(f['task_feats'], dtype=torch.float32)
+            tids = torch.as_tensor(f['task_ids'], dtype=torch.long)
+            req = torch.as_tensor(f['requires'], dtype=torch.bool)
+            free = torch.as_tensor(f['free_pids'], dtype=torch.long)
+            state[b, :sv.shape[0]] = sv
+            task_feats[b, :tf.shape[0]] = tf
+            task_mask[b, :tids.shape[0]] = True
+            # nest ids: 0.. for requires_car==True, else 0; here simple 0/1
+            nid = torch.zeros((T,), dtype=torch.long)
+            nid[:req.shape[0]] = req.to(torch.long)
+            nest_ids[b] = nid
+            # free mask
+            free_mask[b, free.clamp(min=0, max=N-1)] = True
+        dev = torch.device(device)
+        return {
+            'state': state.to(dev),
+            'task_feats': task_feats.to(dev),
+            'task_mask': task_mask.to(dev),
+            'nest_ids': nest_ids.to(dev),
+            'free_mask': free_mask.to(dev),
+        }
+
+    def get_worker_obs_tensor(self, include_global: bool = True, device: str = 'cpu') -> 'torch.Tensor':
+        import torch
+        outs = self.get_worker_obs(include_global)
+        B = len(outs)
+        N = self.N
+        D = int(outs[0]['obs'].shape[1]) if B > 0 else 45
+        obs = torch.zeros((B, N, D), dtype=torch.float32)
+        for b, f in enumerate(outs):
+            ob = torch.as_tensor(f['obs'], dtype=torch.float32)
+            obs[b, :ob.shape[0], :ob.shape[1]] = ob
+        return obs.to(device)
+
+    def step_with_decisions_tensor(self, decisions: List[List[Tuple[int, int]]], device: str = 'cpu') -> Dict[str, 'torch.Tensor']:
+        import torch
+        outs = self.step_with_decisions(decisions)
+        B = len(outs)
+        N = self.N
+        step_reward = torch.zeros((B,), dtype=torch.float32)
+        # infer S from first next_state_vec
+        S = int(outs[0]['next_state_vec'].shape[0]) if B > 0 else 0
+        next_state = torch.zeros((B, S), dtype=torch.float32)
+        rewards_vec = torch.zeros((B, N), dtype=torch.float32)
+        dones_vec = torch.zeros((B, N), dtype=torch.float32)
+        for b, o in enumerate(outs):
+            step_reward[b] = float(o.get('step_reward', 0.0))
+            nsv = torch.as_tensor(o.get('next_state_vec'), dtype=torch.float32)
+            rv = torch.as_tensor(o.get('rewards_vec'), dtype=torch.float32)
+            dv = torch.as_tensor(o.get('dones_vec'), dtype=torch.float32)
+            next_state[b, :nsv.shape[0]] = nsv
+            rewards_vec[b, :rv.shape[0]] = rv
+            dones_vec[b, :dv.shape[0]] = dv
+        dev = torch.device(device)
+        return {
+            'step_reward': step_reward.to(dev),
+            'next_state': next_state.to(dev),
+            'rewards_vec': rewards_vec.to(dev),
+            'dones_vec': dones_vec.to(dev),
+        }
+
+    def step_with_decisions_and_actions_tensor(self, decisions: List[List[Tuple[int, int]]],
+                                               actions: List[List[int]], device: str = 'cpu') -> Dict[str, 'torch.Tensor']:
+        import torch
+        outs = self.step_with_decisions_and_actions(decisions, actions)
+        B = len(outs); N = self.N
+        step_reward = torch.zeros((B,), dtype=torch.float32)
+        S = int(outs[0]['next_state_vec'].shape[0]) if B > 0 else 0
+        next_state = torch.zeros((B, S), dtype=torch.float32)
+        rewards_vec = torch.zeros((B, N), dtype=torch.float32)
+        dones_vec = torch.zeros((B, N), dtype=torch.float32)
+        for b, o in enumerate(outs):
+            step_reward[b] = float(o.get('step_reward', 0.0))
+            nsv = torch.as_tensor(o.get('next_state_vec'), dtype=torch.float32)
+            rv = torch.as_tensor(o.get('rewards_vec'), dtype=torch.float32)
+            dv = torch.as_tensor(o.get('dones_vec'), dtype=torch.float32)
+            next_state[b, :nsv.shape[0]] = nsv
+            rewards_vec[b, :rv.shape[0]] = rv
+            dones_vec[b, :dv.shape[0]] = dv
+        dev = torch.device(device)
+        return {
+            'step_reward': step_reward.to(dev),
+            'next_state': next_state.to(dev),
+            'rewards_vec': rewards_vec.to(dev),
+            'dones_vec': dones_vec.to(dev),
+        }
 
     def get_dqn_obs(self, include_global: bool = True) -> List[Dict[str, Any]]:
         for pc in self.parent_conns:

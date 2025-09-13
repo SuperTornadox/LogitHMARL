@@ -6,7 +6,12 @@ from env.batch_tensor_warehouse_env import BatchTensorWarehouseEnv
 
 
 class TensorVecEnv:
-    """Single-process vectorized env on GPU/CPU tensors, API-compatible with SubprocVecEnv."""
+    """Single-process vectorized env built on BatchTensorWarehouseEnv with tensor I/O.
+
+    Changes vs. earlier version:
+    - get_features returns a dict of batched torch tensors (no numpy/dicts per env)
+    - get_worker_obs returns a [B,N,obs_dim] torch tensor
+    """
 
     def __init__(self, env_config: Dict[str, Any], max_tasks: int, n_envs: int = 32, device: str = 'cuda'):
         dev = device
@@ -14,8 +19,46 @@ class TensorVecEnv:
             dev = 'cpu'
         self.env = BatchTensorWarehouseEnv(env_config, batch_size=int(max(1, n_envs)), max_tasks=max_tasks, device=dev)
 
-    def get_features(self) -> List[Dict[str, Any]]:
-        return self.env.get_features()
+    @torch.no_grad()
+    def get_features(self) -> Dict[str, torch.Tensor]:
+        """Return batched tensors describing per-env global + task state.
+
+        Keys:
+          - state:     [B,S] float32  (global state vector)
+          - task_feats:[B,T,5] float32 (per-task features)
+          - task_mask: [B,T] bool     (True = valid/pending task)
+          - nest_ids:  [B,T] long     (group id per task; here 0/1 by requires_car)
+          - free_mask: [B,N] bool     (True = picker is free to assign)
+        """
+        e = self.env
+        B, T, N, H, W = e.B, e.T, e.N, e.H, e.W
+        device = e.device
+
+        # Global state
+        state = e.get_state_vec()  # [B,S], already on device
+
+        # Task features (normalize shelf coords)
+        sh = e.task_shelf.clamp(min=0)
+        tf = torch.zeros((B, T, 5), dtype=torch.float32, device=device)
+        tf[:, :, 0] = torch.where(e.task_shelf[:, :, 0] >= 0, sh[:, :, 0].float() / max(1, W), 0.0)
+        tf[:, :, 1] = torch.where(e.task_shelf[:, :, 1] >= 0, sh[:, :, 1].float() / max(1, H), 0.0)
+        tf[:, :, 2] = 1.0
+        tf[:, :, 3] = e.task_priority
+        rem = torch.clamp(e.task_deadline_abs - e.current_time.view(B, 1), min=0.0)
+        tf[:, :, 4] = rem
+
+        # Masks/ids
+        task_mask = (e.task_status == 0)
+        nest_ids = e.task_req_car.long().clamp(min=0)  # 0/1 bins by requires_car
+        free_mask = (e.current_task_idx < 0) & (~e.carrying)
+
+        return {
+            'state': state,              # [B,S]
+            'task_feats': tf,            # [B,T,5]
+            'task_mask': task_mask,      # [B,T]
+            'nest_ids': nest_ids,        # [B,T]
+            'free_mask': free_mask,      # [B,N]
+        }
 
     def step_with_decisions(self, decisions: List[List[Tuple[int, int]]]) -> List[Dict[str, Any]]:
         return self.env.assign_and_step(decisions)
@@ -24,13 +67,35 @@ class TensorVecEnv:
                                         actions: List[List[int]]) -> List[Dict[str, Any]]:
         return self.env.assign_and_step_with_actions(decisions, actions)
 
-    def get_worker_obs(self, include_global: bool = True) -> List[Dict[str, Any]]:
-        """Build per-env worker observations matching 45-dim shape (approximate parity)."""
-        outs: List[Dict[str, Any]] = []
-        B, N, H, W, T = self.env.B, self.env.N, self.env.H, self.env.W, self.env.T
-        grid = self.env.grid  # (B,H,W)
+    @torch.no_grad()
+    def step_with_decisions_tensor(self, decisions: List[List[Tuple[int, int]]]) -> Dict[str, torch.Tensor]:
+        _ = self.env.assign_and_step(decisions)
+        # Use cached tensors on device
+        return {
+            'step_reward': self.env.last_step_reward,   # [B]
+            'next_state': self.env.last_next_state,     # [B,S]
+            'rewards_vec': self.env.last_rewards,       # [B,N]
+            'dones_vec': self.env.last_dones,           # [B,N]
+        }
+
+    @torch.no_grad()
+    def step_with_decisions_and_actions_tensor(self, decisions: List[List[Tuple[int, int]]],
+                                               actions: List[List[int]]) -> Dict[str, torch.Tensor]:
+        _ = self.env.assign_and_step_with_actions(decisions, actions)
+        return {
+            'step_reward': self.env.last_step_reward,
+            'next_state': self.env.last_next_state,
+            'rewards_vec': self.env.last_rewards,
+            'dones_vec': self.env.last_dones,
+        }
+
+    @torch.no_grad()
+    def get_worker_obs(self, include_global: bool = True) -> torch.Tensor:
+        """Return worker observations as a tensor of shape [B, N, 45]."""
+        B, N, H, W = self.env.B, self.env.N, self.env.H, self.env.W
+        grid = self.env.grid
+        obs = torch.zeros((B, N, 45 if include_global else 40), dtype=torch.float32, device=self.env.device)
         for b in range(B):
-            obs_list = []
             for i in range(N):
                 px = int(self.env.picker_xy[b, i, 0].item())
                 py = int(self.env.picker_xy[b, i, 1].item())
@@ -77,9 +142,6 @@ class TensorVecEnv:
                     else:
                         vec.extend([0.0, 0.0])
                 if include_global:
-                    # 与 CPU 版 get_agent_observation 的全局附加维度一致：
-                    # [len(task_pool)/20, total_tasks_completed/100, current_time/1000,
-                    #  busy_ratio, 0.0]
                     pending = int((self.env.task_status[b] == 0).sum().item())
                     total_completed = int(self.env.total_tasks_completed[b].item()) if hasattr(self.env, 'total_tasks_completed') else 0
                     busy = float((self.env.current_task_idx[b] >= 0).float().mean().item())
@@ -90,12 +152,12 @@ class TensorVecEnv:
                         busy,
                         0.0,
                     ])
-                # pad to 45
-                while len(vec) < (45 if include_global else 40):
-                    vec.append(0.0)
-                obs_list.append(vec[:(45 if include_global else 40)])
-            outs.append({'obs': torch.tensor(obs_list, dtype=torch.float32).cpu().numpy()})
-        return outs
+                # pad/crop to fixed dim
+                dim = 45 if include_global else 40
+                if len(vec) < dim:
+                    vec.extend([0.0] * (dim - len(vec)))
+                obs[b, i, :dim] = torch.tensor(vec[:dim], dtype=torch.float32, device=self.env.device)
+        return obs
 
     def close(self):
         # Nothing to close in single-process tensor env

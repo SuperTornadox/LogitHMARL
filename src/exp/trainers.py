@@ -771,8 +771,8 @@ def train_nl_hmarl_subproc(
 
     used_envs = int(max(2, n_envs))
     vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
-    f0 = vec.get_features()[0]
-    state_dim = int(np.array(f0['state_vec'], dtype=np.float32).shape[0])
+    f0 = vec.get_features_tensor(device=device)
+    state_dim = int(f0['state'].shape[1])
 
     # Model
     model = NLHMARL(
@@ -796,62 +796,69 @@ def train_nl_hmarl_subproc(
     import time as _time
     _t0 = _time.time()
     for step in pbar:
-        feats_list = vec.get_features()
-        per_env_decisions = [[] for _ in range(len(feats_list))]
-        decisions_all = []
-        returns_all = []
-        # Build decisions
-        for ei, f in enumerate(feats_list):
-            state_vec = np.array(f['state_vec'], dtype=np.float32)
-            task_feats = np.array(f['task_feats'], dtype=np.float32)
-            task_ids = np.array(f['task_ids'], dtype=np.int64)
-            requires = np.array(f['requires'], dtype=np.bool_)
-            free_pids = list(np.array(f['free_pids'], dtype=np.int64))
-            T = int(task_feats.shape[0])
-            nest_ids = np.zeros((T,), dtype=np.int64)
-            nest_ids[:len(requires)] = requires.astype(np.int64)
-            mask = np.zeros((T,), dtype=bool)
-            mask[:len(task_ids)] = True
-            local_mask = mask.copy()
-            for pid in free_pids:
-                if not local_mask.any():
-                    break
-                s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
-                tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
-                nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
-                with torch.no_grad():
-                    sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
-                idx = int(sel.item())
-                if idx < 0 or idx >= len(task_ids) or not local_mask[idx]:
+        feats = vec.get_features_tensor(device=model.device)
+        state = feats['state']
+        task_feats = feats['task_feats']
+        nest_ids = feats['nest_ids']
+        task_mask = feats['task_mask']
+        free_mask = feats['free_mask']
+
+        B, T = task_mask.shape
+        per_env_decisions = [[] for _ in range(B)]
+        batch_states, batch_tf, batch_nid, batch_mask, batch_idx = [], [], [], [], []
+        free_lists = [torch.nonzero(free_mask[b], as_tuple=False).squeeze(1).tolist() for b in range(B)]
+        next_ptr = [0 for _ in range(B)]
+        local_mask = task_mask.clone()
+        max_free = int(max((len(fl) for fl in free_lists), default=0))
+        for _it in range(max_free):
+            active_envs = [b for b in range(B) if next_ptr[b] < len(free_lists[b]) and bool(local_mask[b].any().item())]
+            if not active_envs:
+                break
+            s_act = state[active_envs]
+            tf_act = task_feats[active_envs]
+            nid_act = nest_ids[active_envs]
+            m_act = local_mask[active_envs]
+            with torch.no_grad():
+                sel, _ = model.select_tasks(s_act, tf_act, nid_act, m_act, deterministic=False)
+            for j, b in enumerate(active_envs):
+                idx = int(sel[j].item())
+                if idx < 0 or not bool(m_act[j, idx].item()):
                     continue
-                per_env_decisions[ei].append((int(pid), int(task_ids[idx])))
-                local_mask[idx] = False
-                decisions_all.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
-        # Step envs
-        outs = vec.step_with_decisions(per_env_decisions)
-        # Prepare returns
-        for ei, out in enumerate(outs):
-            if len(per_env_decisions[ei]) == 0:
-                continue
-            r = float(out.get('step_reward', 0.0))
-            nsv = np.array(out.get('next_state_vec'), dtype=np.float32)
+                pid = int(free_lists[b][next_ptr[b]])
+                per_env_decisions[b].append((pid, idx))
+                batch_states.append(s_act[j:j+1])
+                batch_tf.append(tf_act[j:j+1])
+                batch_nid.append(nid_act[j:j+1])
+                batch_mask.append(m_act[j:j+1].clone())
+                batch_idx.append(torch.tensor([idx], dtype=torch.long, device=model.device))
+                local_mask[b, idx] = False
+                next_ptr[b] += 1
+
+        # Env step with tensor collation
+        stp = vec.step_with_decisions_tensor(per_env_decisions, device=model.device)
+        if len(batch_idx) > 0:
+            next_states = stp['next_state']  # [B,S]
             with torch.no_grad():
-                v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-            returns_all.append(torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next.item())
-        # Update manager
-        if len(decisions_all) > 0:
-            batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
-            batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
-            batch_nid = torch.cat([d[2] for d in decisions_all], dim=0)
-            batch_mask = torch.cat([d[3] for d in decisions_all], dim=0)
-            batch_idx = torch.stack([d[4] for d in decisions_all], dim=0).to(model.device)
-            returns = torch.cat(returns_all, dim=0)
+                v_next_env = model.value_net(next_states).squeeze(-1)  # [B]
+            rewards_env = stp['step_reward']  # [B]
+            returns_list = []
+            env_has = torch.tensor([len(per_env_decisions[b]) for b in range(B)], device=model.device)
+            for b in range(B):
+                k = int(env_has[b].item())
+                if k > 0:
+                    ret_b = torch.full((k,), float(rewards_env[b].item()), dtype=torch.float32, device=model.device) + gamma * v_next_env[b]
+                    returns_list.append(ret_b)
+            returns = torch.cat(returns_list, dim=0) if len(returns_list) > 0 else torch.empty((0,), device=model.device)
+            batch_states_t = torch.cat(batch_states, dim=0)
+            batch_tf_t = torch.cat(batch_tf, dim=0)
+            batch_nid_t = torch.cat(batch_nid, dim=0)
+            batch_mask_t = torch.cat(batch_mask, dim=0)
+            batch_idx_t = torch.cat(batch_idx, dim=0)
             with torch.no_grad():
-                v = model.value_net(batch_states).squeeze(-1)
+                v = model.value_net(batch_states_t).squeeze(-1)
             adv = returns - v
-            loss_dict = model.compute_manager_loss(batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
-                                                   task_mask=batch_mask, entropy_coef=entropy_coef)
+            loss_dict = model.compute_manager_loss(batch_states_t, batch_tf_t, batch_nid_t, batch_idx_t, adv, returns,
+                                                   task_mask=batch_mask_t, entropy_coef=entropy_coef)
             optim.zero_grad(); loss_dict['total_loss'].backward()
             torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
             optim.step()
@@ -867,17 +874,14 @@ def train_nl_hmarl_subproc(
         if log_metrics and (step % max(1, log_every) == 0):
             steps_log.append(step)
             loss_log.append(cur_loss)
-            try:
-                mean_rew = float(np.mean([float(o.get('step_reward', 0.0)) for o in outs]))
-            except Exception:
-                mean_rew = 0.0
-            reward_log.append(mean_rew)
+            reward_log.append(float(stp['step_reward'].mean().item()))
             pol_log.append(cur_pl); val_log.append(cur_vl); entL_log.append(cur_el); ent_log.append(cur_ent)
         try:
             elapsed = max(1e-6, (_time.time() - _t0))
             env_steps = (step + 1) * used_envs
             sps = env_steps / elapsed
-            pbar.set_postfix(envs=used_envs, env_steps=env_steps, sps=f"{sps:.1f}", rew=f"{mean_rew:.2f}", loss=f"{(cur_loss if np.isfinite(cur_loss) else 0):.3f}")
+            step_rew = float(stp['step_reward'].mean().item())
+            pbar.set_postfix(envs=used_envs, env_steps=env_steps, sps=f"{sps:.1f}", rew=f"{step_rew:.2f}", loss=f"{(cur_loss if np.isfinite(cur_loss) else 0):.3f}")
         except Exception:
             pass
 
@@ -1444,8 +1448,8 @@ def train_nl_hmarl_tensorvec(
     from baselines.nl_hmarl import NLHMARL
 
     vec = TensorVecEnv(env_config, max_tasks=max_tasks, n_envs=int(max(1, n_envs)), device=device)
-    f0 = vec.get_features()[0]
-    state_dim = int(np.array(f0['state_vec'], dtype=np.float32).shape[0])
+    f = vec.get_features()
+    state_dim = int(f['state'].shape[1])
 
     model = NLHMARL(
         state_dim=state_dim,
@@ -1465,58 +1469,72 @@ def train_nl_hmarl_tensorvec(
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL (tensorvec)', ncols=100)
     for step in pbar:
-        feats_list = vec.get_features()
-        per_env_decisions = [[] for _ in range(len(feats_list))]
-        decisions_all = []
-        returns_all = []
-        for ei, f in enumerate(feats_list):
-            state_vec = np.array(f['state_vec'], dtype=np.float32)
-            task_feats = np.array(f['task_feats'], dtype=np.float32)
-            task_ids = np.array(f['task_ids'], dtype=np.int64)
-            requires = np.array(f['requires'], dtype=np.bool_)
-            free_pids = list(np.array(f['free_pids'], dtype=np.int64))
-            T = int(task_feats.shape[0])
-            nest_ids = np.zeros((T,), dtype=np.int64)
-            nest_ids[:len(requires)] = requires.astype(np.int64)
-            mask = np.zeros((T,), dtype=bool)
-            mask[:len(task_ids)] = True
-            local_mask = mask.copy()
-            for pid in free_pids:
-                if not local_mask.any():
-                    break
-                s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
-                tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
-                nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
-                with torch.no_grad():
-                    sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
-                idx = int(sel.item())
-                if idx < 0 or idx >= len(task_ids) or not local_mask[idx]:
+        feats = vec.get_features()
+        state = feats['state'].to(model.device)
+        task_feats = feats['task_feats'].to(model.device)
+        nest_ids = feats['nest_ids'].to(model.device)
+        task_mask = feats['task_mask'].to(model.device)
+        free_mask = feats['free_mask'].to(model.device)
+
+        B, T = task_mask.shape
+        free_lists = [torch.nonzero(free_mask[b], as_tuple=False).squeeze(1).tolist() for b in range(B)]
+        next_ptr = [0 for _ in range(B)]
+        per_env_decisions = [[] for _ in range(B)]
+
+        batch_states, batch_tf, batch_nid, batch_mask, batch_idx = [], [], [], [], []
+        local_mask = task_mask.clone()
+        max_free = int(max((len(fl) for fl in free_lists), default=0))
+        for it in range(max_free):
+            active_envs = [b for b in range(B) if next_ptr[b] < len(free_lists[b]) and bool(local_mask[b].any().item())]
+            if len(active_envs) == 0:
+                break
+            s_act = state[active_envs]
+            tf_act = task_feats[active_envs]
+            nid_act = nest_ids[active_envs]
+            m_act = local_mask[active_envs]
+            with torch.no_grad():
+                sel, _ = model.select_tasks(s_act, tf_act, nid_act, m_act, deterministic=False)
+            for j, b in enumerate(active_envs):
+                idx = int(sel[j].item())
+                if idx < 0 or not bool(m_act[j, idx].item()):
                     continue
-                per_env_decisions[ei].append((int(pid), int(task_ids[idx])))
-                local_mask[idx] = False
-                decisions_all.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
-        outs = vec.step_with_decisions(per_env_decisions)
-        for ei, out in enumerate(outs):
-            if len(per_env_decisions[ei]) == 0:
-                continue
-            r = float(out.get('step_reward', 0.0))
-            nsv = np.array(out.get('next_state_vec'), dtype=np.float32)
+                pid = int(free_lists[b][next_ptr[b]])
+                per_env_decisions[b].append((pid, idx))
+                batch_states.append(s_act[j:j+1])
+                batch_tf.append(tf_act[j:j+1])
+                batch_nid.append(nid_act[j:j+1])
+                batch_mask.append(m_act[j:j+1].clone())
+                batch_idx.append(torch.tensor([idx], dtype=torch.long, device=model.device))
+                local_mask[b, idx] = False
+                next_ptr[b] += 1
+
+        stp = vec.step_with_decisions_tensor(per_env_decisions)
+
+        cur_loss = float('nan'); cur_pl = float('nan'); cur_vl = float('nan'); cur_el = float('nan'); cur_ent = float('nan')
+        env_has = torch.tensor([len(per_env_decisions[b]) for b in range(B)], device=model.device)
+        if len(batch_idx) > 0:
+            next_states = stp['next_state'].to(model.device)  # [B,S]
             with torch.no_grad():
-                v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-            returns_all.append(torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next.item())
-        if len(decisions_all) > 0:
-            batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
-            batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
-            batch_nid = torch.cat([d[2] for d in decisions_all], dim=0)
-            batch_mask = torch.cat([d[3] for d in decisions_all], dim=0)
-            batch_idx = torch.stack([d[4] for d in decisions_all], dim=0).to(model.device)
-            returns = torch.cat(returns_all, dim=0)
+                v_next_env = model.value_net(next_states).squeeze(-1)  # [B]
+            rewards_env = stp['step_reward'].to(model.device)  # [B]
+            returns_list = []
+            for b in range(B):
+                k = int(env_has[b].item())
+                if k > 0:
+                    ret_b = torch.full((k,), float(rewards_env[b].item()), dtype=torch.float32, device=model.device) + gamma * v_next_env[b]
+                    returns_list.append(ret_b)
+            returns = torch.cat(returns_list, dim=0) if len(returns_list) > 0 else torch.empty((0,), device=model.device)
+
+            batch_states_t = torch.cat(batch_states, dim=0)
+            batch_tf_t = torch.cat(batch_tf, dim=0)
+            batch_nid_t = torch.cat(batch_nid, dim=0)
+            batch_mask_t = torch.cat(batch_mask, dim=0)
+            batch_idx_t = torch.cat(batch_idx, dim=0)
             with torch.no_grad():
-                v = model.value_net(batch_states).squeeze(-1)
+                v = model.value_net(batch_states_t).squeeze(-1)
             adv = returns - v
-            loss_dict = model.compute_manager_loss(batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
-                                                   task_mask=batch_mask, entropy_coef=entropy_coef)
+            loss_dict = model.compute_manager_loss(batch_states_t, batch_tf_t, batch_nid_t, batch_idx_t, adv, returns,
+                                                   task_mask=batch_mask_t, entropy_coef=entropy_coef)
             optim.zero_grad(); loss_dict['total_loss'].backward()
             torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
             optim.step()
@@ -1525,20 +1543,15 @@ def train_nl_hmarl_tensorvec(
             cur_vl = float(loss_dict['value_loss'].item())
             cur_el = float(loss_dict['entropy_loss'].item())
             cur_ent = float(loss_dict['entropy'].item())
-        else:
-            cur_loss = float('nan'); cur_pl = float('nan'); cur_vl = float('nan'); cur_el = float('nan'); cur_ent = float('nan')
 
         if log_metrics and (step % max(1, log_every) == 0):
             steps_log.append(step)
             loss_log.append(cur_loss)
-            try:
-                mean_rew = float(np.mean([float(o.get('step_reward', 0.0)) for o in outs]))
-            except Exception:
-                mean_rew = 0.0
-            reward_log.append(mean_rew)
+            step_rew = float(stp['step_reward'].mean().item()) if isinstance(stp, dict) else 0.0
+            reward_log.append(step_rew)
             pol_log.append(cur_pl); val_log.append(cur_vl); entL_log.append(cur_el); ent_log.append(cur_ent)
         try:
-            pbar.set_postfix(rew=f"{mean_rew:.2f}", loss=f"{(cur_loss if np.isfinite(cur_loss) else 0):.3f}")
+            pbar.set_postfix(rew=f"{step_rew:.2f}", loss=f"{(0 if not np.isfinite(cur_loss) else cur_loss):.3f}")
         except Exception:
             pass
 
@@ -1569,6 +1582,221 @@ def train_nl_hmarl_tensorvec(
                 plt.close()
         except Exception as e:
             print(f"[warn] Failed to save NL-HMARL (tensorvec) metrics: {e}")
+    try:
+        vec.close()
+    except Exception:
+        pass
+    return model
+
+
+# Override: batched-tensor collated subproc trainer (manager+workers)
+def train_nl_hmarl_ac_subproc(
+    *,
+    env_config: dict,
+    training_steps: int = 5000,
+    hidden_dim: int = 256,
+    lr_manager: float = 1e-3,
+    lr_workers: float = 1e-3,
+    max_tasks: int = 20,
+    gamma: float = 0.99,
+    entropy_coef_manager: float = 0.01,
+    entropy_coef_workers: float = 0.01,
+    # NL manager structure
+    n_nests: int = 4,
+    learn_eta: bool = False,
+    eta_init: float = 1.0,
+    device: str = 'cpu',
+    n_envs: int = 4,
+    # logging
+    log_metrics: bool = True,
+    log_every: int = 100,
+    metrics_dir: str = 'results/train_metrics',
+    metrics_tag: str = 'NL-HMARL-AC',
+):
+    _enable_torch_perf()
+    import os
+    import torch
+    import numpy as np
+    from tqdm import tqdm
+    from baselines.nl_hmarl import NLHMARL
+
+    used_envs = int(max(2, n_envs))
+    vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
+    f0 = vec.get_features_tensor(device=device)
+    state_dim = int(f0['state'].shape[1])
+    worker_obs_dim = 45
+    worker_action_dim = 7
+    n_agents = int(env_config.get('n_pickers', 1))
+
+    model = NLHMARL(
+        state_dim=state_dim,
+        n_tasks=max_tasks,
+        n_nests=n_nests,
+        worker_obs_dim=worker_obs_dim,
+        worker_action_dim=worker_action_dim,
+        n_agents=n_agents,
+        hidden_dim=hidden_dim,
+        device=device,
+        learn_eta=learn_eta,
+        eta_init=eta_init,
+    )
+    opt_manager = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr_manager)
+    opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
+
+    steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
+    m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
+    pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (subproc)', ncols=100)
+
+    for step in pbar:
+        feats = vec.get_features_tensor(device=model.device)
+        state = feats['state']
+        task_feats = feats['task_feats']
+        nest_ids = feats['nest_ids']
+        task_mask = feats['task_mask']
+        free_mask = feats['free_mask']
+
+        B, N = free_mask.shape
+        # Manager batched decisions
+        per_env_decisions: List[List[int]] = [[] for _ in range(B)]
+        batch_states, batch_tf, batch_nid, batch_mask, batch_idx = [], [], [], [], []
+        free_lists = [torch.nonzero(free_mask[b], as_tuple=False).squeeze(1).tolist() for b in range(B)]
+        next_ptr = [0 for _ in range(B)]
+        local_mask = task_mask.clone()
+        max_free = int(max((len(fl) for fl in free_lists), default=0))
+        for _it in range(max_free):
+            active_envs = [b for b in range(B) if next_ptr[b] < len(free_lists[b]) and bool(local_mask[b].any().item())]
+            if not active_envs:
+                break
+            s_act = state[active_envs]
+            tf_act = task_feats[active_envs]
+            nid_act = nest_ids[active_envs]
+            m_act = local_mask[active_envs]
+            with torch.no_grad():
+                sel, _ = model.select_tasks(s_act, tf_act, nid_act, m_act, deterministic=False)
+            for j, b in enumerate(active_envs):
+                idx = int(sel[j].item())
+                if idx < 0 or not bool(m_act[j, idx].item()):
+                    continue
+                pid = int(free_lists[b][next_ptr[b]])
+                per_env_decisions[b].append((pid, idx))
+                batch_states.append(s_act[j:j+1])
+                batch_tf.append(tf_act[j:j+1])
+                batch_nid.append(nid_act[j:j+1])
+                batch_mask.append(m_act[j:j+1].clone())
+                batch_idx.append(torch.tensor([idx], dtype=torch.long, device=model.device))
+                local_mask[b, idx] = False
+                next_ptr[b] += 1
+
+        # Worker obs/actions batched
+        obs = vec.get_worker_obs_tensor(include_global=True, device=model.device)  # [B,N,45]
+        obs_b = obs.view(B * N, worker_obs_dim)
+        with torch.no_grad():
+            w_out = model.workers(obs_b)
+            a_idx = torch.multinomial(torch.clamp(w_out['action_probs'], min=1e-8), num_samples=1).squeeze(1)
+        a_mat = a_idx.view(B, N)
+        actions_per_env = [[int(a_mat[b, i].item()) for i in range(N)] for b in range(B)]
+
+        # Step envs (tensor collation)
+        stp = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env, device=model.device)
+
+        # Manager update
+        cur_m_loss = float('nan'); cur_m_pl = float('nan'); cur_m_vl = float('nan'); cur_m_el = float('nan'); cur_m_ent = float('nan')
+        env_has = torch.tensor([len(per_env_decisions[b]) for b in range(B)], device=model.device)
+        if len(batch_idx) > 0:
+            next_states = stp['next_state']
+            with torch.no_grad():
+                v_next_env = model.value_net(next_states).squeeze(-1)
+            rewards_env = stp['step_reward']
+            returns_list = []
+            for b in range(B):
+                k = int(env_has[b].item())
+                if k > 0:
+                    ret_b = torch.full((k,), float(rewards_env[b].item()), dtype=torch.float32, device=model.device) + gamma * v_next_env[b]
+                    returns_list.append(ret_b)
+            returns = torch.cat(returns_list, dim=0) if len(returns_list) > 0 else torch.empty((0,), device=model.device)
+            batch_states_t = torch.cat(batch_states, dim=0)
+            batch_tf_t = torch.cat(batch_tf, dim=0)
+            batch_nid_t = torch.cat(batch_nid, dim=0)
+            batch_mask_t = torch.cat(batch_mask, dim=0)
+            batch_idx_t = torch.cat(batch_idx, dim=0)
+            with torch.no_grad():
+                v = model.value_net(batch_states_t).squeeze(-1)
+            adv = returns - v
+            m_losses = model.compute_manager_loss(batch_states_t, batch_tf_t, batch_nid_t, batch_idx_t, adv, returns,
+                                                  task_mask=batch_mask_t, entropy_coef=entropy_coef_manager)
+            opt_manager.zero_grad(); m_losses['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
+            opt_manager.step()
+            cur_m_loss = float(m_losses['total_loss'].item())
+            cur_m_pl = float(m_losses['policy_loss'].item())
+            cur_m_vl = float(m_losses['value_loss'].item())
+            cur_m_el = float(m_losses['entropy_loss'].item())
+            cur_m_ent = float(m_losses['entropy'].item())
+
+        # Worker update
+        next_obs = vec.get_worker_obs_tensor(include_global=True, device=model.device)
+        next_obs_b = next_obs.view(B * N, worker_obs_dim)
+        with torch.no_grad():
+            next_vals = model.workers(next_obs_b)['value']
+        r_vec = stp['rewards_vec'].reshape(B * N)
+        d_vec = stp['dones_vec'].reshape(B * N)
+        out2 = model.workers(obs_b)
+        log_probs_all = torch.log(torch.clamp(out2['action_probs'], min=1e-8))
+        act_logp = log_probs_all.gather(1, a_idx.unsqueeze(1)).squeeze(1)
+        returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+        adv_w = returns_w - out2['value']
+        policy_loss = -(adv_w.detach() * act_logp).mean()
+        value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+        entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
+        total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
+        opt_workers.zero_grad(); total_w_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.workers.parameters(), 1.0)
+        opt_workers.step()
+        cur_w_loss = float(total_w_loss.item())
+
+        # Logging
+        if log_metrics and (step % max(1, log_every) == 0):
+            steps_log.append(step)
+            m_loss_log.append(cur_m_loss)
+            w_loss_log.append(cur_w_loss)
+            reward_log.append(float(stp['step_reward'].mean().item()))
+            m_pl_log.append(cur_m_pl)
+            m_vl_log.append(cur_m_vl)
+            m_entL_log.append(cur_m_el)
+            m_ent_log.append(cur_m_ent)
+        try:
+            pbar.set_postfix(rew=f"{float(stp['step_reward'].mean().item()):.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
+        except Exception:
+            pass
+
+    # Save metrics
+    if log_metrics:
+        try:
+            out_dir = os.path.join(metrics_dir or 'results/train_metrics', (metrics_tag or 'NL-HMARL-AC') + '_subproc')
+            os.makedirs(out_dir, exist_ok=True)
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            df = pd.DataFrame({
+                'step': steps_log,
+                'manager_loss': m_loss_log,
+                'worker_loss': w_loss_log,
+                'step_reward': reward_log,
+                'policy_loss': m_pl_log,
+                'value_loss': m_vl_log,
+                'entropy_loss': m_entL_log,
+                'entropy': m_ent_log,
+            })
+            df.to_csv(os.path.join(out_dir, 'metrics.csv'), index=False)
+            if len(steps_log) > 0:
+                plt.figure(figsize=(7, 4))
+                plt.plot(steps_log, m_pl_log, label='policy_loss')
+                plt.plot(steps_log, m_vl_log, label='value_loss')
+                plt.plot(steps_log, m_entL_log, label='entropy_loss')
+                plt.legend(fontsize=8)
+                plt.xlabel('step'); plt.ylabel('loss'); plt.title(f'{metrics_tag} Manager Loss Components (subproc)')
+                plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'manager_losses.png')); plt.close()
+        except Exception as e:
+            print(f"[warn] Failed to save NL-HMARL-AC (subproc) metrics: {e}")
     try:
         vec.close()
     except Exception:
@@ -1767,6 +1995,218 @@ def train_nl_hmarl_ac_tensorvec(
             m_ent_log.append(cur_m_ent)
         try:
             pbar.set_postfix(rew=f"{mean_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}")
+        except Exception:
+            pass
+
+    if log_metrics:
+        try:
+            out_dir = os.path.join(metrics_dir or 'results/train_metrics', (metrics_tag or 'NL-HMARL-AC') + '_tensorvec')
+            os.makedirs(out_dir, exist_ok=True)
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            df = pd.DataFrame({
+                'step': steps_log,
+                'manager_loss': m_loss_log,
+                'worker_loss': w_loss_log,
+                'step_reward': reward_log,
+                'policy_loss': m_pl_log,
+                'value_loss': m_vl_log,
+                'entropy_loss': m_entL_log,
+                'entropy': m_ent_log,
+            })
+            df.to_csv(os.path.join(out_dir, 'metrics.csv'), index=False)
+            if len(steps_log) > 0:
+                plt.figure(figsize=(7, 4))
+                plt.plot(steps_log, m_pl_log, label='policy_loss')
+                plt.plot(steps_log, m_vl_log, label='value_loss')
+                plt.plot(steps_log, m_entL_log, label='entropy_loss')
+                plt.legend(fontsize=8)
+                plt.xlabel('step'); plt.ylabel('loss'); plt.title(f'{metrics_tag} Manager Loss Components (tensorvec)')
+                plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'manager_losses.png'))
+                plt.close()
+        except Exception as e:
+            print(f"[warn] Failed to save NL-HMARL-AC (tensorvec) metrics: {e}")
+    try:
+        vec.close()
+    except Exception:
+        pass
+    return model
+
+
+# New batched-tensor version overriding the earlier definition above.
+def train_nl_hmarl_ac_tensorvec(
+    *,
+    env_config: dict,
+    training_steps: int = 5000,
+    hidden_dim: int = 256,
+    lr_manager: float = 1e-3,
+    lr_workers: float = 1e-3,
+    max_tasks: int = 20,
+    gamma: float = 0.99,
+    entropy_coef_manager: float = 0.01,
+    entropy_coef_workers: float = 0.01,
+    n_nests: int = 4,
+    learn_eta: bool = False,
+    eta_init: float = 1.0,
+    device: str = 'cuda',
+    n_envs: int = 32,
+    log_metrics: bool = True,
+    log_every: int = 100,
+    metrics_dir: str = 'results/train_metrics',
+    metrics_tag: str = 'NL-HMARL-AC',
+):
+    from exp.vecenv_tensor import TensorVecEnv
+    import os
+    import torch
+    import numpy as np
+    from tqdm import tqdm
+    from baselines.nl_hmarl import NLHMARL
+
+    vec = TensorVecEnv(env_config, max_tasks=max_tasks, n_envs=int(max(1, n_envs)), device=device)
+    f = vec.get_features()
+    state_dim = int(f['state'].shape[1])
+    worker_obs_dim = 45
+    worker_action_dim = 7
+    n_agents = int(env_config.get('n_pickers', 1))
+
+    model = NLHMARL(
+        state_dim=state_dim,
+        n_tasks=max_tasks,
+        n_nests=n_nests,
+        worker_obs_dim=worker_obs_dim,
+        worker_action_dim=worker_action_dim,
+        n_agents=n_agents,
+        hidden_dim=hidden_dim,
+        device=device,
+        learn_eta=learn_eta,
+        eta_init=eta_init,
+    )
+    opt_manager = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr_manager)
+    opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
+
+    steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
+    m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
+    pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (tensorvec)', ncols=100)
+    for step in pbar:
+        feats = vec.get_features()
+        state = feats['state'].to(model.device)
+        task_feats = feats['task_feats'].to(model.device)
+        nest_ids = feats['nest_ids'].to(model.device)
+        task_mask = feats['task_mask'].to(model.device)
+        free_mask = feats['free_mask'].to(model.device)
+
+        B, N = free_mask.shape
+        T = task_mask.shape[1]
+        free_lists = [torch.nonzero(free_mask[b], as_tuple=False).squeeze(1).tolist() for b in range(B)]
+        next_ptr = [0 for _ in range(B)]
+        per_env_decisions = [[] for _ in range(B)]
+        batch_states, batch_tf, batch_nid, batch_mask, batch_idx = [], [], [], [], []
+        local_mask = task_mask.clone()
+        max_free = int(max((len(fl) for fl in free_lists), default=0))
+        for it in range(max_free):
+            active_envs = [b for b in range(B) if next_ptr[b] < len(free_lists[b]) and bool(local_mask[b].any().item())]
+            if len(active_envs) == 0:
+                break
+            s_act = state[active_envs]
+            tf_act = task_feats[active_envs]
+            nid_act = nest_ids[active_envs]
+            m_act = local_mask[active_envs]
+            with torch.no_grad():
+                sel, _ = model.select_tasks(s_act, tf_act, nid_act, m_act, deterministic=False)
+            for j, b in enumerate(active_envs):
+                idx = int(sel[j].item())
+                if idx < 0 or not bool(m_act[j, idx].item()):
+                    continue
+                pid = int(free_lists[b][next_ptr[b]])
+                per_env_decisions[b].append((pid, idx))
+                batch_states.append(s_act[j:j+1])
+                batch_tf.append(tf_act[j:j+1])
+                batch_nid.append(nid_act[j:j+1])
+                batch_mask.append(m_act[j:j+1].clone())
+                batch_idx.append(torch.tensor([idx], dtype=torch.long, device=model.device))
+                local_mask[b, idx] = False
+                next_ptr[b] += 1
+
+        # Worker obs -> actions for all B*N
+        obs = vec.get_worker_obs(include_global=True).to(model.device)  # [B,N,45]
+        obs_b = obs.view(B * N, worker_obs_dim)
+        with torch.no_grad():
+            out_workers = model.workers(obs_b)
+            a_idx = torch.multinomial(torch.clamp(out_workers['action_probs'], min=1e-8), num_samples=1).squeeze(1)
+        a_mat = a_idx.view(B, N)
+        actions_per_env = [[int(a_mat[b, i].item()) for i in range(N)] for b in range(B)]
+
+        # Step envs (tensor outputs)
+        stp = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env)
+
+        # Manager update
+        cur_m_loss = float('nan'); cur_m_pl = float('nan'); cur_m_vl = float('nan'); cur_m_el = float('nan'); cur_m_ent = float('nan')
+        env_has = torch.tensor([len(per_env_decisions[b]) for b in range(B)], device=model.device)
+        if len(batch_idx) > 0:
+            next_states = stp['next_state'].to(model.device)  # [B,S]
+            with torch.no_grad():
+                v_next_env = model.value_net(next_states).squeeze(-1)  # [B]
+            rewards_env = stp['step_reward'].to(model.device)  # [B]
+            returns_list = []
+            for b in range(B):
+                k = int(env_has[b].item())
+                if k > 0:
+                    ret_b = torch.full((k,), float(rewards_env[b].item()), dtype=torch.float32, device=model.device) + gamma * v_next_env[b]
+                    returns_list.append(ret_b)
+            returns = torch.cat(returns_list, dim=0) if len(returns_list) > 0 else torch.empty((0,), device=model.device)
+
+            batch_states_t = torch.cat(batch_states, dim=0)
+            batch_tf_t = torch.cat(batch_tf, dim=0)
+            batch_nid_t = torch.cat(batch_nid, dim=0)
+            batch_mask_t = torch.cat(batch_mask, dim=0)
+            batch_idx_t = torch.cat(batch_idx, dim=0)
+            with torch.no_grad():
+                v = model.value_net(batch_states_t).squeeze(-1)
+            adv = returns - v
+            m_losses = model.compute_manager_loss(batch_states_t, batch_tf_t, batch_nid_t, batch_idx_t, adv, returns,
+                                                  task_mask=batch_mask_t, entropy_coef=entropy_coef_manager)
+            opt_manager.zero_grad(); m_losses['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
+            opt_manager.step()
+            cur_m_loss = float(m_losses['total_loss'].item())
+            cur_m_pl = float(m_losses['policy_loss'].item())
+            cur_m_vl = float(m_losses['value_loss'].item())
+            cur_m_el = float(m_losses['entropy_loss'].item())
+            cur_m_ent = float(m_losses['entropy'].item())
+
+        # Worker update
+        next_obs = vec.get_worker_obs(include_global=True).to(model.device)
+        next_obs_b = next_obs.view(B * N, worker_obs_dim)
+        with torch.no_grad():
+            next_vals = model.workers(next_obs_b)['value']
+        r_vec = stp['rewards_vec'].to(model.device).reshape(B * N)
+        d_vec = stp['dones_vec'].to(model.device).reshape(B * N)
+        out2 = model.workers(obs_b)
+        log_probs_all = torch.log(torch.clamp(out2['action_probs'], min=1e-8))
+        act_logp = log_probs_all.gather(1, a_idx.unsqueeze(1)).squeeze(1)
+        returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+        adv_w = returns_w - out2['value']
+        policy_loss = -(adv_w.detach() * act_logp).mean()
+        value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+        entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
+        total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
+        opt_workers.zero_grad(); total_w_loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.workers.parameters(), 1.0)
+        opt_workers.step()
+        cur_w_loss = float(total_w_loss.item())
+
+        if log_metrics and (step % max(1, log_every) == 0):
+            steps_log.append(step)
+            m_loss_log.append(cur_m_loss)
+            w_loss_log.append(cur_w_loss)
+            mean_rew = float(stp['step_reward'].mean().item())
+            reward_log.append(mean_rew)
+            m_pl_log.append(cur_m_pl)
+            m_vl_log.append(cur_m_vl)
+            m_entL_log.append(cur_m_el)
+            m_ent_log.append(cur_m_ent)
+        try:
+            pbar.set_postfix(rew=f"{mean_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
         except Exception:
             pass
 

@@ -518,55 +518,6 @@ class BatchTensorWarehouseEnv:
             self.on_time_completions += ((cur_t <= D) & done_mask).float().sum(dim=1).long()
         # Idle 惩罚（统一累加）
         rewards = rewards + torch.where(actions == 4, torch.full_like(rewards, self.rew_cfg['idle_penalty']), torch.zeros_like(rewards))
-                    # IDLE: try pick/drop
-                    tid = self.current_task_idx[b, i].item()
-                    if tid >= 0:
-                        sh = self.task_shelf[b, tid]
-                        st = self.task_station[b, tid]
-                        # Pick if adjacent to shelf and not carrying
-                        if (not self.carrying[b, i]) and (abs(int(self.picker_xy[b, i, 0]) - int(sh[0])) + abs(int(self.picker_xy[b, i, 1]) - int(sh[1])) == 1):
-                            # forklift-only constraint
-                            req = bool(self.task_req_car[b, tid].item())
-                            if req and (not bool(self.picker_is_forklift[b, i].item())):
-                                rewards[b, i] += -0.5
-                            else:
-                                self.carrying[b, i] = True
-                                # scaled pick reward
-                                cls_name = self._cls_name(b, tid)
-                                pick_base = self.cfg.get('reward_config', {}).get('pick_base', {'forklift_only': 4.0, 'heavy': 3.0, 'medium': 2.0, 'light': 1.0})
-                                fork_eff = self.cfg.get('reward_config', {}).get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
-                                reg_eff = self.cfg.get('reward_config', {}).get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
-                                eff_type = fork_eff if bool(self.picker_is_forklift[b, i].item()) else reg_eff
-                                rewards[b, i] += float(pick_base.get(cls_name, 1.0) * eff_type.get(cls_name, 1.0))
-                        # Drop if adjacent to station and carrying
-                        if self.carrying[b, i] and (abs(int(self.picker_xy[b, i, 0]) - int(st[0])) + abs(int(self.picker_xy[b, i, 1]) - int(st[1])) == 1):
-                            self.carrying[b, i] = False
-                            # value/late rewards
-                            cur_t = float(self.current_time[b].item())
-                            base = float(self.task_value_base[b, tid].item())
-                            D = float(self.task_deadline_abs[b, tid].item())
-                            if cur_t <= D:
-                                val = base
-                            elif cur_t < 2 * D:
-                                val = base * (2 * D - cur_t) / max(1e-6, D)
-                            else:
-                                val = 0.0
-                            # scaled drop reward + value
-                            drop_base = self.cfg.get('reward_config', {}).get('drop_base', {'forklift_only': 5.0, 'heavy': 4.0, 'medium': 2.5, 'light': 1.5})
-                            fork_eff = self.cfg.get('reward_config', {}).get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
-                            reg_eff = self.cfg.get('reward_config', {}).get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
-                            cls_name = self._cls_name(b, tid)
-                            eff_type = fork_eff if bool(self.picker_is_forklift[b, i].item()) else reg_eff
-                            rewards[b, i] += float(drop_base.get(cls_name, 1.0) * eff_type.get(cls_name, 1.0)) + float(val)
-                            if cur_t > D:
-                                rewards[b, i] += self.rew_cfg['late_penalty']
-                            # Complete task
-                            self.task_status[b, tid] = 2
-                            self.task_assigned[b, tid] = -1
-                            self.current_task_idx[b, i] = -1
-                # idle penalty when action is IDLE
-                if a == 4:
-                    rewards[b, i] += self.rew_cfg['idle_penalty']
 
         # Battery and congestion penalties
         # Battery drains per move/idle

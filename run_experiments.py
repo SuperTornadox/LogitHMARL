@@ -121,7 +121,8 @@ nl_cfg = dict(
     entropy_coef_workers=0.01,
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
-    deterministic_eval=False,
+    deterministic_eval=True,
+    eval_n_envs=128,
     n_envs=256, # default to 256 when using tensor vecenv
 )
 

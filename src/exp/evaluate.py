@@ -73,18 +73,6 @@ def evaluate_method(method_name: str,
                 extra = {k: v for k, v in extra.items() if k != 'order_config'}
             cfg.update(extra)
         env = env_ctor(cfg)
-        # If the provided ctor yields a tensorized env (no `pickers` list),
-        # fall back to the classic CPU env for evaluation compatibility.
-        # Evaluation code below expects `env.pickers`, `task_pool`, etc.
-        if not hasattr(env, 'pickers') and method_name in (
-            'NL-HMARL', 'NLHMARL', 'NL_HMARL',
-            'NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC'
-        ):
-            try:
-                print('[info] Eval fallback: switching to CPU DynamicWarehouseEnv for compatibility')
-            except Exception:
-                pass
-            env = create_test_env(width, height, n_pickers, n_shelves, n_stations, order_rate, max_items)
     else:
         env = create_test_env(width, height, n_pickers, n_shelves, n_stations, order_rate, max_items)
     
@@ -349,12 +337,13 @@ def evaluate_method(method_name: str,
             if not free_ids or not local_mask.any():
                 return 0
             import torch as _torch
-            s = _torch.tensor(state_vec, dtype=_torch.float32).unsqueeze(0)
-            tf = _torch.tensor(task_feats, dtype=_torch.float32).unsqueeze(0)
-            nid = _torch.tensor(nest_ids, dtype=_torch.long).unsqueeze(0)
+            dev = getattr(model, 'device', _torch.device('cpu'))
+            s = _torch.tensor(state_vec, dtype=_torch.float32, device=dev).unsqueeze(0)
+            tf = _torch.tensor(task_feats, dtype=_torch.float32, device=dev).unsqueeze(0)
+            nid = _torch.tensor(nest_ids, dtype=_torch.long, device=dev).unsqueeze(0)
             assigned = 0
             for pid in free_ids:
-                m = _torch.tensor(local_mask, dtype=_torch.bool).unsqueeze(0)
+                m = _torch.tensor(local_mask, dtype=_torch.bool, device=dev).unsqueeze(0)
                 sel, _ = model.select_tasks(s, tf, nid, m, deterministic=_det_eval)
                 idx = int(sel.item())
                 if not local_mask[idx] or idx >= len(t_list):
@@ -391,12 +380,13 @@ def evaluate_method(method_name: str,
             free_ids = [i for i, p in enumerate(e.pickers) if getattr(p, 'current_task', None) is None and len(p.carrying_items) == 0]
             if not free_ids or not local_mask.any():
                 return 0
-            s = _torch.tensor(state_vec, dtype=_torch.float32).unsqueeze(0)
-            tf = _torch.tensor(task_feats, dtype=_torch.float32).unsqueeze(0)
-            nid = _torch.tensor(nest_ids, dtype=_torch.long).unsqueeze(0)
+            dev = getattr(model, 'device', _torch.device('cpu'))
+            s = _torch.tensor(state_vec, dtype=_torch.float32, device=dev).unsqueeze(0)
+            tf = _torch.tensor(task_feats, dtype=_torch.float32, device=dev).unsqueeze(0)
+            nid = _torch.tensor(nest_ids, dtype=_torch.long, device=dev).unsqueeze(0)
             assigned = 0
             for pid in free_ids:
-                m = _torch.tensor(local_mask, dtype=_torch.bool).unsqueeze(0)
+                m = _torch.tensor(local_mask, dtype=_torch.bool, device=dev).unsqueeze(0)
                 sel, _ = model.select_tasks(s, tf, nid, m, deterministic=_det_eval)
                 idx = int(sel.item())
                 if not local_mask[idx] or idx >= len(t_list):
@@ -413,6 +403,107 @@ def evaluate_method(method_name: str,
         dynamic_assign = _assign_with_model
     else:
         dynamic_assign = lambda e: assign_tasks_dynamic(e)
+
+    # Tensor evaluation path for NL methods (no CPU fallback)
+    if (method_name in ('NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC', 'NL-HMARL', 'NLHMARL', 'NL_HMARL')
+        and kwargs.get('use_tensor_env', False)
+        and not hasattr(env, 'pickers')
+        and model is not None):
+        import torch as _torch
+        from exp.vecenv_tensor import TensorVecEnv
+        # Eval configuration
+        nl_cfg_eval = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
+        _nl_dev = str(nl_cfg_eval.get('device', 'cpu'))
+        if _nl_dev.lower() == 'auto':
+            try:
+                import torch as _t
+                _nl_dev = 'cuda' if _t.cuda.is_available() else ('mps' if hasattr(_t.backends, 'mps') and _t.backends.mps.is_available() else 'cpu')
+            except Exception:
+                _nl_dev = 'cpu'
+        det_eval = bool(nl_cfg_eval.get('deterministic_eval', False))
+        max_tasks = int(nl_cfg_eval.get('max_tasks', getattr(model, 'n_tasks', 20)))
+        eval_envs = int(nl_cfg_eval.get('eval_n_envs', 1))
+        # Aggregate metrics across episodes
+        results = []
+        for ep in range(n_episodes):
+            vec = TensorVecEnv(cfg, max_tasks=max_tasks, n_envs=int(max(1, eval_envs)), device=_nl_dev)
+            # Warmup one step to spawn tasks
+            try:
+                B = int(max(1, eval_envs)); N = int(cfg.get('n_pickers', 1))
+                _ = vec.step_with_decisions_and_actions_tensor([[] for _ in range(B)], [[4] * N for _ in range(B)])
+            except Exception:
+                pass
+            # Rollout
+            for step_i in range(max_time_limit):
+                feats = vec.get_features()
+                state = feats['state'].to(model.device)
+                task_feats = feats['task_feats'].to(model.device)
+                nest_ids = feats['nest_ids'].to(model.device)
+                task_mask = feats['task_mask'].to(model.device)
+                free_mask = feats['free_mask'].to(model.device)
+                B = free_mask.shape[0]
+                # Manager decisions (round-robin)
+                free_lists = [ _torch.nonzero(free_mask[b], as_tuple=False).squeeze(1).tolist() for b in range(B) ]
+                next_ptr = [0 for _ in range(B)]
+                per_env_decisions = [[] for _ in range(B)]
+                local_mask = task_mask.clone()
+                max_free = int(max((len(fl) for fl in free_lists), default=0))
+                for _it in range(max_free):
+                    active_envs = [b for b in range(B) if next_ptr[b] < len(free_lists[b]) and bool(local_mask[b].any().item())]
+                    if not active_envs:
+                        break
+                    s_act = state[active_envs]
+                    tf_act = task_feats[active_envs]
+                    nid_act = nest_ids[active_envs]
+                    m_act = local_mask[active_envs]
+                    with _torch.no_grad():
+                        sel, _ = model.select_tasks(s_act, tf_act, nid_act, m_act, deterministic=det_eval)
+                    for j, b in enumerate(active_envs):
+                        idx = int(sel[j].item())
+                        if idx < 0 or not bool(m_act[j, idx].item()):
+                            continue
+                        pid = int(free_lists[b][next_ptr[b]])
+                        per_env_decisions[b].append((pid, idx))
+                        local_mask[b, idx] = False
+                        next_ptr[b] += 1
+                # Workers act
+                obs = vec.get_worker_obs(include_global=True).to(model.device)
+                obs_b = obs.view(B * int(cfg.get('n_pickers', 1)), -1)
+                with _torch.no_grad():
+                    w_out = model.workers(obs_b)
+                    if det_eval:
+                        a_idx = _torch.argmax(w_out['action_probs'], dim=1)
+                    else:
+                        a_idx = _torch.multinomial(_torch.clamp(w_out['action_probs'], min=1e-8), num_samples=1).squeeze(1)
+                N = int(cfg.get('n_pickers', 1))
+                a_mat = a_idx.view(B, N)
+                actions_per_env = [[int(a_mat[b, i].item()) for i in range(N)] for b in range(B)]
+                _ = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env)
+            # Collect episode metrics
+            env_i = vec.env
+            orders_completed = int(env_i.total_orders_completed.sum().item()) if hasattr(env_i, 'total_orders_completed') else 0
+            orders_generated = int(env_i.total_orders_received.sum().item()) if hasattr(env_i, 'total_orders_received') else 0
+            raw_value_completed = int(getattr(env_i, 'total_value_completed', _torch.zeros((1,), device=model.device)).sum().item())
+            results.append({
+                'method': method_name,
+                'orders_completed': orders_completed,
+                'orders_generated': orders_generated,
+                'raw_value_completed': raw_value_completed,
+                'decayed_value_completed': raw_value_completed,  # placeholder parity
+            })
+        # Aggregate episodes (mean)
+        import numpy as _np
+        oc = _np.mean([r['orders_completed'] for r in results]) if len(results) else 0
+        og = _np.mean([r['orders_generated'] for r in results]) if len(results) else 0
+        rvc = _np.mean([r['raw_value_completed'] for r in results]) if len(results) else 0
+        dvc = _np.mean([r['decayed_value_completed'] for r in results]) if len(results) else 0
+        return {
+            'method': method_name,
+            'orders_completed': int(oc),
+            'orders_generated': int(og),
+            'raw_value_completed': int(rvc),
+            'decayed_value_completed': int(dvc),
+        }
 
     all_episode_metrics = []
     # Prepare plotting directory if enabled

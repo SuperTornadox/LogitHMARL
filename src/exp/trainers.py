@@ -596,6 +596,7 @@ def train_nl_hmarl(
 
     # Logging buffers
     steps_log, loss_log, reward_log = [], [], []
+    env_steps_log = []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL', ncols=100)
     for step in pbar:
@@ -993,6 +994,7 @@ def train_nl_hmarl_ac(
     opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
 
     steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
+    env_steps_log = []
     m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC', ncols=100)
 
@@ -1473,6 +1475,7 @@ def train_nl_hmarl_tensorvec(
         _ = vec.step_with_decisions_and_actions_tensor([[] for _ in range(B_warm)], [[4] * N_warm for _ in range(B_warm)])
     except Exception:
         pass
+    used_envs = int(max(1, n_envs))
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL (tensorvec)', ncols=100)
     for step in pbar:
         feats = vec.get_features()
@@ -1556,10 +1559,12 @@ def train_nl_hmarl_tensorvec(
             step_rew = float(stp['step_reward'].mean().item()) if isinstance(stp, dict) else 0.0
             reward_log.append(step_rew)
             pol_log.append(cur_pl); val_log.append(cur_vl); entL_log.append(cur_el); ent_log.append(cur_ent)
+            env_steps_log.append(int((step + 1) * used_envs))
         # Do not coerce NaN to 0 in display; show 'nan' if not finite
         disp_loss = cur_loss if np.isfinite(cur_loss) else float('nan')
         try:
-            pbar.set_postfix(rew=f"{step_rew:.2f}", loss=f"{disp_loss:.3f}")
+            env_steps = (step + 1) * used_envs
+            pbar.set_postfix(envs=used_envs, env_steps=env_steps, rew=f"{step_rew:.2f}", loss=f"{disp_loss:.3f}")
         except Exception:
             pass
 
@@ -1571,6 +1576,7 @@ def train_nl_hmarl_tensorvec(
             import matplotlib.pyplot as plt
             df = pd.DataFrame({
                 'step': steps_log,
+                'env_steps': env_steps_log,
                 'loss': loss_log,
                 'step_reward': reward_log,
                 'policy_loss': pol_log,
@@ -1872,6 +1878,7 @@ def train_nl_hmarl_ac_tensorvec(
         _ = vec.step_with_decisions_and_actions_tensor([[] for _ in range(B_warm)], [[4] * N_warm for _ in range(B_warm)])
     except Exception:
         pass
+    used_envs = int(max(1, n_envs))
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (tensorvec)', ncols=100)
     for step in pbar:
         feats_list = vec.get_features()
@@ -2221,8 +2228,10 @@ def train_nl_hmarl_ac_tensorvec(
             m_vl_log.append(cur_m_vl)
             m_entL_log.append(cur_m_el)
             m_ent_log.append(cur_m_ent)
+            env_steps_log.append(int((step + 1) * used_envs))
         try:
-            pbar.set_postfix(rew=f"{mean_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
+            env_steps = (step + 1) * used_envs
+            pbar.set_postfix(envs=used_envs, env_steps=env_steps, rew=f"{mean_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
         except Exception:
             pass
 
@@ -2234,6 +2243,7 @@ def train_nl_hmarl_ac_tensorvec(
             import matplotlib.pyplot as plt
             df = pd.DataFrame({
                 'step': steps_log,
+                'env_steps': env_steps_log,
                 'manager_loss': m_loss_log,
                 'worker_loss': w_loss_log,
                 'step_reward': reward_log,

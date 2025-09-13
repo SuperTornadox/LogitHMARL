@@ -75,7 +75,7 @@ env_cfg = dict(
 
 # 训练参数（Flat-DQN）
 train_cfg = dict(
-    training_steps=100000,
+    training_steps=10000,
     batch_size=2048,
     learning_rate=1e-3,
     buffer_size=200000,

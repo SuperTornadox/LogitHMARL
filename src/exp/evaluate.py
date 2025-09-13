@@ -435,7 +435,8 @@ def evaluate_method(method_name: str,
             except Exception:
                 pass
             # Rollout
-            for step_i in range(max_time_limit):
+            step_bar = tqdm(range(max_time_limit), desc=f"Ep {ep+1}/{n_episodes}", ncols=100, leave=False)
+            for step_i in step_bar:
                 feats = vec.get_features()
                 state = feats['state'].to(model.device)
                 task_feats = feats['task_feats'].to(model.device)
@@ -479,10 +480,20 @@ def evaluate_method(method_name: str,
                 N = int(cfg.get('n_pickers', 1))
                 a_mat = a_idx.view(B, N)
                 actions_per_env = [[int(a_mat[b, i].item()) for i in range(N)] for b in range(B)]
-                _ = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env)
+                stp = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env)
+                # update step progress
+                try:
+                    mean_rew = float(stp['step_reward'].mean().item())
+                    step_bar.set_postfix(rew=f"{mean_rew:.2f}")
+                except Exception:
+                    pass
             # simple postfix per episode
             try:
                 ep_bar.set_postfix(ep=ep+1, steps=max_time_limit)
+            except Exception:
+                pass
+            try:
+                step_bar.close()
             except Exception:
                 pass
             # Collect episode metrics

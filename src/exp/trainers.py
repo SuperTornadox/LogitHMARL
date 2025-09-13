@@ -226,6 +226,238 @@ def train_flat_dqn(
     return model
 
 
+def train_flat_dqn_subproc(
+    width: int, height: int,
+    n_pickers: int, n_shelves: int, n_stations: int,
+    order_rate: int, max_items: int,
+    training_steps: int = 5000,
+    pure_learning: bool = False,
+    hidden_dim: int = 256,
+    lr: float = 1e-3,
+    batch_size: int = 64,
+    buffer_size: int = 10000,
+    update_freq: int = 4,
+    target_update_freq: int = 100,
+    # logging
+    log_metrics: bool = True,
+    log_every: int = 100,
+    metrics_dir: Optional[str] = 'results/train_metrics',
+    metrics_tag: Optional[str] = None,
+    # device
+    device: str = 'cpu',
+    # vec
+    n_envs: int = 4,
+):
+    """Flat-DQN with SubprocVecEnv parallel rollout.
+
+    Notes:
+    - Each env contains n_pickers agents; observations are concatenated across envs for a single forward.
+    - Actions are picked per-agent with epsilon-greedy and sent back to each env.
+    """
+    # Build env_config consistent with env_factory.create_test_env
+    env_config = {
+        'width': width,
+        'height': height,
+        'n_pickers': n_pickers,
+        'n_shelves': n_shelves,
+        'n_stations': n_stations,
+        'n_charging_pads': 1,
+        'levels_per_shelf': 3,
+        'time_step': 2.0,
+        'order_config': {
+            'base_rate': order_rate,
+            'peak_hours': [(9, 12), (14, 17)],
+            'peak_multiplier': 1.6,
+            'off_peak_multiplier': 0.7,
+            'simulation_hours': 2,
+        },
+    }
+    vec = SubprocVecEnv(int(max(2, n_envs)), env_config, max_tasks=20)
+
+    obs_dim = 40 if pure_learning else 45
+    action_dim = 7
+    model = FlatMARLDQN(
+        state_dim=obs_dim,
+        action_dim=action_dim,
+        n_agents=n_pickers,
+        hidden_dim=hidden_dim,
+        lr=lr,
+        target_update_freq=target_update_freq,
+        batch_size=batch_size,
+        buffer_size=buffer_size,
+        use_double_dqn=True,
+        use_dueling=True,
+        device=device,
+    )
+
+    try:
+        from tqdm import tqdm
+        pbar = tqdm(range(training_steps), desc='Train DQN (subproc)', ncols=100)
+    except Exception:
+        pbar = range(training_steps)
+
+    avg_reward_ema = None
+    last_loss: Optional[float] = None
+    steps_log, eps_log, loss_log, stepR_log, avgR_log = [], [], [], [], []
+    q_logs = []
+
+    include_global = not pure_learning
+    total_agents = int(max(2, n_envs)) * n_pickers
+    for step in pbar:
+        # Collect observations and masks from all envs
+        outs = vec.get_dqn_obs(include_global=include_global)
+        # Stack
+        obs_batches = [o['obs'] for o in outs if 'obs' in o]
+        mask_batches = [o['masks'] for o in outs if 'masks' in o]
+        if len(obs_batches) == 0:
+            continue
+        obs_all = np.vstack(obs_batches)
+        masks_all = np.vstack(mask_batches)
+        obs_tensor = torch.tensor(obs_all, dtype=torch.float32, device=model.device)
+        with torch.no_grad():
+            q_vals = model.q_network(obs_tensor).detach().cpu().numpy()  # (E*N,7)
+        q_vals[masks_all == 0] = -np.inf
+        # Epsilon per-current step across all agents
+        eps_start = getattr(model, 'epsilon_start', 1.0)
+        eps_end = getattr(model, 'epsilon_end', 0.05)
+        eps_decay = max(1, int(getattr(model, 'epsilon_decay', 100000)))
+        cur_eps = eps_end + (eps_start - eps_end) * np.exp(-float(model.steps_done) / float(eps_decay))
+        explore = (np.random.rand(obs_all.shape[0]) < cur_eps)
+        chosen = np.full((obs_all.shape[0],), 4, dtype=np.int64)
+        for i in range(obs_all.shape[0]):
+            if explore[i]:
+                valid_idx = np.where(masks_all[i] == 1)[0]
+                if len(valid_idx) == 0:
+                    chosen[i] = int(np.argmax(q_vals[i])) if np.all(np.isfinite(q_vals[i])) else 4
+                else:
+                    chosen[i] = int(np.random.choice(valid_idx))
+            else:
+                chosen[i] = int(np.nanargmax(q_vals[i])) if np.any(np.isfinite(q_vals[i])) else 4
+        # Update epsilon counter (per agent across all envs)
+        model.steps_done += obs_all.shape[0]
+        model.epsilon = eps_end + (eps_start - eps_end) * np.exp(-float(model.steps_done) / float(eps_decay))
+        # Split chosen actions back per env
+        actions_per_env: List[List[int]] = []
+        offset = 0
+        for o in outs:
+            n = o['obs'].shape[0]
+            actions_per_env.append(chosen[offset:offset+n].tolist())
+            offset += n
+        step_outs = vec.step_dqn(actions_per_env, include_global=include_global)
+        # Aggregate rewards and store transitions
+        total_step_reward = 0.0
+        next_obs_all = []
+        rewards_all = []
+        dones_all = []
+        offset = 0
+        for i, o in enumerate(outs):
+            n = o['obs'].shape[0]
+            so = step_outs[i]
+            total_step_reward += float(so.get('step_reward', 0.0))
+            next_obs_chunk = np.array(so.get('next_obs'), dtype=np.float32)
+            r_vec = np.array(so.get('rewards_vec'), dtype=np.float32)
+            d_vec = np.array(so.get('dones_vec'), dtype=np.float32)
+            # Store transitions per-agent
+            for j in range(n):
+                model.store_transition(
+                    o['obs'][j],
+                    actions_per_env[i][j],
+                    float(r_vec[j]),
+                    next_obs_chunk[j],
+                    bool(d_vec[j] > 0.5),
+                )
+            next_obs_all.append(next_obs_chunk)
+            rewards_all.append(r_vec)
+            dones_all.append(d_vec)
+            offset += n
+
+        step_reward_mean = total_step_reward / max(1, len(step_outs))
+        if avg_reward_ema is None:
+            avg_reward_ema = step_reward_mean
+        else:
+            avg_reward_ema = 0.98 * avg_reward_ema + 0.02 * step_reward_mean
+
+        # Train
+        if step % update_freq == 0:
+            loss = model.train_step()
+            if loss is not None:
+                last_loss = float(loss)
+        # Metrics per log_every
+        if log_metrics and (step % max(1, log_every) == 0):
+            try:
+                with torch.no_grad():
+                    qm = model.q_network(torch.tensor(obs_all, dtype=torch.float32, device=model.device)).detach().cpu().numpy().mean(axis=0)
+            except Exception:
+                qm = np.zeros((7,), dtype=np.float32)
+            steps_log.append(step)
+            eps_log.append(float(getattr(model, 'epsilon', 0.0)))
+            loss_log.append(float('nan') if last_loss is None else float(last_loss))
+            stepR_log.append(float(step_reward_mean))
+            avgR_log.append(float(avg_reward_ema))
+            q_logs.append(qm.tolist())
+
+        try:
+            pbar.set_postfix(avgR=f"{avg_reward_ema:.2f}", loss=f"{(last_loss or 0):.3f}")
+        except Exception:
+            pass
+
+    # Save metrics
+    if log_metrics:
+        try:
+            import os
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            tag = metrics_tag or 'DQN'
+            out_dir = metrics_dir or 'results/train_metrics'
+            out_dir = os.path.join(out_dir, tag + '_subproc')
+            os.makedirs(out_dir, exist_ok=True)
+            cols = ['q_up', 'q_down', 'q_left', 'q_right', 'q_idle', 'q_pick', 'q_drop']
+            q_arr = np.array(q_logs) if len(q_logs) > 0 else np.zeros((0, 7))
+            df = pd.DataFrame({
+                'step': steps_log,
+                'epsilon': eps_log,
+                'loss': loss_log,
+                'step_reward': stepR_log,
+                'avg_reward_ema': avgR_log,
+                'policy_loss': [float('nan')] * len(steps_log),
+                'value_loss': [float('nan')] * len(steps_log),
+                'entropy_loss': [float('nan')] * len(steps_log),
+                'entropy': [float('nan')] * len(steps_log),
+            })
+            if len(q_logs) > 0:
+                for i, c in enumerate(cols):
+                    df[c] = q_arr[:, i]
+            df.to_csv(os.path.join(out_dir, 'metrics.csv'), index=False)
+            if len(steps_log) > 0:
+                plt.figure(figsize=(6, 3))
+                plt.plot(steps_log, eps_log, label='epsilon')
+                plt.xlabel('step'); plt.ylabel('epsilon'); plt.title(f'{tag} Epsilon (subproc)')
+                plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'epsilon.png')); plt.close()
+                plt.figure(figsize=(6, 3))
+                plt.plot(steps_log, loss_log, label='loss', alpha=0.8)
+                plt.xlabel('step'); plt.ylabel('loss'); plt.title(f'{tag} Loss (subproc)')
+                plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'loss.png')); plt.close()
+                plt.figure(figsize=(6, 3))
+                plt.plot(steps_log, stepR_log, label='step_reward', alpha=0.5)
+                plt.plot(steps_log, avgR_log, label='avg_reward_ema', alpha=0.9)
+                plt.legend(); plt.xlabel('step'); plt.ylabel('reward'); plt.title(f'{tag} Rewards (subproc)')
+                plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'rewards.png')); plt.close()
+                if len(q_logs) > 0:
+                    plt.figure(figsize=(7, 4))
+                    for i, c in enumerate(cols):
+                        plt.plot(steps_log, q_arr[:, i], label=c)
+                    plt.legend(ncol=3, fontsize=8)
+                    plt.xlabel('step'); plt.ylabel('Q'); plt.title(f'{tag} Mean Q per action (subproc)')
+                    plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'q_values.png')); plt.close()
+        except Exception as e:
+            print(f'[warn] Failed to save DQN (subproc) metrics: {e}')
+    try:
+        vec.close()
+    except Exception:
+        pass
+    return model
+
+
 def train_nl_hmarl(
     *,
     env_ctor,
@@ -871,4 +1103,228 @@ def train_nl_hmarl_ac(
                 plt.close()
         except Exception as e:
             print(f"[warn] Failed to save NL-HMARL-AC metrics: {e}")
+    return model
+
+
+def train_nl_hmarl_ac_subproc(
+    *,
+    env_config: dict,
+    training_steps: int = 5000,
+    hidden_dim: int = 256,
+    lr_manager: float = 1e-3,
+    lr_workers: float = 1e-3,
+    max_tasks: int = 20,
+    gamma: float = 0.99,
+    entropy_coef_manager: float = 0.01,
+    entropy_coef_workers: float = 0.01,
+    # NL manager structure
+    n_nests: int = 4,
+    learn_eta: bool = False,
+    eta_init: float = 1.0,
+    device: str = 'cpu',
+    n_envs: int = 4,
+    # logging
+    log_metrics: bool = True,
+    log_every: int = 100,
+    metrics_dir: str = 'results/train_metrics',
+    metrics_tag: str = 'NL-HMARL-AC',
+):
+    import os
+    import torch
+    import numpy as np
+    from tqdm import tqdm
+    from baselines.nl_hmarl import NLHMARL
+
+    vec = SubprocVecEnv(int(max(2, n_envs)), env_config, max_tasks=max_tasks)
+    f0 = vec.get_features()[0]
+    # Dimensions
+    state_dim = int(np.array(f0['state_vec'], dtype=np.float32).shape[0])
+    worker_obs_dim = 45
+    worker_action_dim = 7
+    n_agents = int(env_config.get('n_pickers', 1))
+
+    model = NLHMARL(
+        state_dim=state_dim,
+        n_tasks=max_tasks,
+        n_nests=n_nests,
+        worker_obs_dim=worker_obs_dim,
+        worker_action_dim=worker_action_dim,
+        n_agents=n_agents,
+        hidden_dim=hidden_dim,
+        device=device,
+        learn_eta=learn_eta,
+        eta_init=eta_init,
+    )
+    opt_manager = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr_manager)
+    opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
+
+    steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
+    m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
+    pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (subproc)', ncols=100)
+
+    for step in pbar:
+        feats_list = vec.get_features()
+        per_env_decisions = [[] for _ in range(len(feats_list))]
+        decisions_all = []
+        returns_all = []
+        # Build decisions with manager
+        for ei, f in enumerate(feats_list):
+            state_vec = np.array(f['state_vec'], dtype=np.float32)
+            task_feats = np.array(f['task_feats'], dtype=np.float32)
+            task_ids = np.array(f['task_ids'], dtype=np.int64)
+            requires = np.array(f['requires'], dtype=np.bool_)
+            free_pids = list(np.array(f['free_pids'], dtype=np.int64))
+            T = int(task_feats.shape[0])
+            nest_ids = np.zeros((T,), dtype=np.int64)
+            nest_ids[:len(requires)] = requires.astype(np.int64)
+            mask = np.zeros((T,), dtype=bool)
+            mask[:len(task_ids)] = True
+            local_mask = mask.copy()
+            for pid in free_pids:
+                if not local_mask.any():
+                    break
+                s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
+                tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
+                nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
+                with torch.no_grad():
+                    sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
+                idx = int(sel.item())
+                if idx < 0 or idx >= len(task_ids) or not local_mask[idx]:
+                    continue
+                per_env_decisions[ei].append((int(pid), int(task_ids[idx])))
+                local_mask[idx] = False
+                decisions_all.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
+        # Worker obs and actions
+        obs_list = vec.get_worker_obs(include_global=True)
+        actions_per_env: List[List[int]] = []
+        obs_all = []
+        for ei, ob in enumerate(obs_list):
+            obs = np.array(ob.get('obs'), dtype=np.float32)
+            obs_tensor = torch.tensor(obs, dtype=torch.float32, device=model.device)
+            out = model.workers(obs_tensor)
+            with torch.no_grad():
+                a_idx = torch.multinomial(torch.clamp(out['action_probs'], min=1e-8), num_samples=1).squeeze(1)
+            actions = [int(a_idx[i].item()) for i in range(obs.shape[0])]
+            actions_per_env.append(actions)
+            obs_all.append(obs_tensor)
+        # Step envs with decisions and worker actions
+        outs = vec.step_with_decisions_and_actions(per_env_decisions, actions_per_env)
+
+        # Manager returns
+        cur_m_loss = float('nan'); cur_m_pl = float('nan'); cur_m_vl = float('nan'); cur_m_el = float('nan'); cur_m_ent = float('nan')
+        for ei, out in enumerate(outs):
+            if len(per_env_decisions[ei]) == 0:
+                continue
+            r = float(out.get('step_reward', 0.0))
+            nsv = np.array(out.get('next_state_vec'), dtype=np.float32)
+            with torch.no_grad():
+                v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
+            returns_all.append(torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next.item())
+        if len(decisions_all) > 0:
+            batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
+            batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
+            batch_nid = torch.cat([d[2] for d in decisions_all], dim=0)
+            batch_mask = torch.cat([d[3] for d in decisions_all], dim=0)
+            batch_idx = torch.stack([d[4] for d in decisions_all], dim=0).to(model.device)
+            returns = torch.cat(returns_all, dim=0)
+            with torch.no_grad():
+                v = model.value_net(batch_states).squeeze(-1)
+            adv = returns - v
+            loss_dict = model.compute_manager_loss(batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
+                                                   task_mask=batch_mask, entropy_coef=entropy_coef_manager)
+            opt_manager.zero_grad(); loss_dict['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
+            opt_manager.step()
+            cur_m_loss = float(loss_dict['total_loss'].item())
+            cur_m_pl = float(loss_dict['policy_loss'].item())
+            cur_m_vl = float(loss_dict['value_loss'].item())
+            cur_m_el = float(loss_dict['entropy_loss'].item())
+            cur_m_ent = float(loss_dict['entropy'].item())
+
+        # Worker A2C update
+        actions_all = []
+        rewards_all = []
+        dones_all = []
+        next_obs_all = []
+        for ei, out in enumerate(outs):
+            actions_all.append(torch.tensor(actions_per_env[ei], dtype=torch.long, device=model.device))
+            rewards_all.append(torch.tensor(np.array(out.get('rewards_vec'), dtype=np.float32), dtype=torch.float32, device=model.device))
+            dones_all.append(torch.tensor(np.array(out.get('dones_vec'), dtype=np.float32), dtype=torch.float32, device=model.device))
+            next_obs_all.append(torch.tensor(np.array(out.get('next_obs'), dtype=np.float32), dtype=torch.float32, device=model.device))
+        if len(obs_all) > 0:
+            obs_b = torch.cat(obs_all, dim=0)
+            actions_b = torch.cat(actions_all, dim=0)
+            out2 = model.workers(obs_b)
+            log_probs_all = torch.log(torch.clamp(out2['action_probs'], min=1e-8))
+            act_logp = log_probs_all.gather(1, actions_b.unsqueeze(1)).squeeze(1)
+            next_obs_tensor = torch.cat(next_obs_all, dim=0)
+            with torch.no_grad():
+                next_vals = model.workers(next_obs_tensor)['value']
+            r_vec = torch.cat(rewards_all, dim=0)
+            d_vec = torch.cat(dones_all, dim=0)
+            returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+            adv_w = returns_w - out2['value']
+            policy_loss = -(adv_w.detach() * act_logp).mean()
+            value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+            entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
+            total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
+            opt_workers.zero_grad(); total_w_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.workers.parameters(), 1.0)
+            opt_workers.step()
+            cur_w_loss = float(total_w_loss.item())
+        else:
+            cur_w_loss = float('nan')
+
+        # Logging state
+        try:
+            step_rew = float(np.mean([float(o.get('step_reward', 0.0)) for o in outs]))
+        except Exception:
+            step_rew = 0.0
+        if log_metrics and (step % max(1, log_every) == 0):
+            steps_log.append(step)
+            m_loss_log.append(cur_m_loss)
+            w_loss_log.append(cur_w_loss)
+            reward_log.append(step_rew)
+            m_pl_log.append(cur_m_pl)
+            m_vl_log.append(cur_m_vl)
+            m_entL_log.append(cur_m_el)
+            m_ent_log.append(cur_m_ent)
+        try:
+            pbar.set_postfix(rew=f"{step_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
+        except Exception:
+            pass
+
+    # Save metrics
+    if log_metrics:
+        try:
+            out_dir = os.path.join(metrics_dir or 'results/train_metrics', (metrics_tag or 'NL-HMARL-AC') + '_subproc')
+            os.makedirs(out_dir, exist_ok=True)
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            df = pd.DataFrame({
+                'step': steps_log,
+                'manager_loss': m_loss_log,
+                'worker_loss': w_loss_log,
+                'step_reward': reward_log,
+                'policy_loss': m_pl_log,
+                'value_loss': m_vl_log,
+                'entropy_loss': m_entL_log,
+                'entropy': m_ent_log,
+            })
+            df.to_csv(os.path.join(out_dir, 'metrics.csv'), index=False)
+            if len(steps_log) > 0:
+                plt.figure(figsize=(7, 4))
+                plt.plot(steps_log, m_pl_log, label='policy_loss')
+                plt.plot(steps_log, m_vl_log, label='value_loss')
+                plt.plot(steps_log, m_entL_log, label='entropy_loss')
+                plt.legend(fontsize=8)
+                plt.xlabel('step'); plt.ylabel('loss'); plt.title(f'{metrics_tag} Manager Loss Components (subproc)')
+                plt.grid(alpha=0.3); plt.tight_layout(); plt.savefig(os.path.join(out_dir, 'manager_losses.png')); plt.close()
+        except Exception as e:
+            print(f"[warn] Failed to save NL-HMARL-AC (subproc) metrics: {e}")
+    try:
+        vec.close()
+    except Exception:
+        pass
     return model

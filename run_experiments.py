@@ -116,6 +116,7 @@ nl_cfg = dict(
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
     deterministic_eval=False,
+    n_envs=32, # number of environments to train on
 )
 
 # DQN hyperparameters (device only for now)

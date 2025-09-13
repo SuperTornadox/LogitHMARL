@@ -96,24 +96,47 @@ def evaluate_method(method_name: str,
                     _dev = 'cpu'
             except Exception:
                 _dev = 'cpu'
-        model = train_flat_dqn(width, height, n_pickers, n_shelves, n_stations,
-                               order_rate, max_items,
-                               training_steps=training_steps,
-                               pure_learning=is_pure,
-                               hidden_dim=hidden_dim,
-                               lr=learning_rate,
-                               batch_size=batch_size,
-                               buffer_size=buffer_size,
-                               update_freq=update_freq,
-                               target_update_freq=target_update_freq,
-                               # metrics logging
-                               log_metrics=True,
-                               log_every=max(1, training_steps // 200),  # ~200 points
-                               metrics_dir='results/train_metrics',
-                               metrics_tag=method_name,
-                               # pass speed function so env can step
-                               speed_function=speed_function,
-                               device=_dev)
+        n_envs_cfg = int(dqn_cfg.get('n_envs', 1))
+        if n_envs_cfg > 1:
+            print(f"[info] Using SubprocVecEnv with n_envs={n_envs_cfg} for DQN")
+            from exp.trainers import train_flat_dqn_subproc
+            model = train_flat_dqn_subproc(
+                width, height, n_pickers, n_shelves, n_stations,
+                order_rate, max_items,
+                training_steps=training_steps,
+                pure_learning=is_pure,
+                hidden_dim=hidden_dim,
+                lr=learning_rate,
+                batch_size=batch_size,
+                buffer_size=buffer_size,
+                update_freq=update_freq,
+                target_update_freq=target_update_freq,
+                log_metrics=True,
+                log_every=max(1, training_steps // 200),
+                metrics_dir='results/train_metrics',
+                metrics_tag=method_name,
+                device=_dev,
+                n_envs=n_envs_cfg,
+            )
+        else:
+            model = train_flat_dqn(width, height, n_pickers, n_shelves, n_stations,
+                                   order_rate, max_items,
+                                   training_steps=training_steps,
+                                   pure_learning=is_pure,
+                                   hidden_dim=hidden_dim,
+                                   lr=learning_rate,
+                                   batch_size=batch_size,
+                                   buffer_size=buffer_size,
+                                   update_freq=update_freq,
+                                   target_update_freq=target_update_freq,
+                                   # metrics logging
+                                   log_metrics=True,
+                                   log_every=max(1, training_steps // 200),  # ~200 points
+                                   metrics_dir='results/train_metrics',
+                                   metrics_tag=method_name,
+                                   # pass speed function so env can step
+                                   speed_function=speed_function,
+                                   device=_dev)
     elif method_name in ('NL-HMARL', 'NLHMARL', 'NL_HMARL') and env_ctor is not None:
         from exp.trainers import train_nl_hmarl, train_nl_hmarl_subproc
         nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
@@ -132,6 +155,7 @@ def evaluate_method(method_name: str,
         # Train on a fresh env with same config (use subproc vecenv if n_envs>1)
         n_envs_cfg = int(nl_cfg.get('n_envs', 1))
         if n_envs_cfg > 1:
+            print(f"[info] Using SubprocVecEnv with n_envs={n_envs_cfg} for NL-HMARL")
             model = train_nl_hmarl_subproc(
                 env_config=cfg,
                 training_steps=training_steps,
@@ -187,28 +211,53 @@ def evaluate_method(method_name: str,
                     _nl_dev = 'cpu'
             except Exception:
                 _nl_dev = 'cpu'
-        model = train_nl_hmarl_ac(
-            env_ctor=env_ctor,
-            env_config=cfg,
-            training_steps=training_steps,
-            hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
-            lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
-            lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
-            max_tasks=int(nl_cfg.get('max_tasks', 20)),
-            gamma=float(nl_cfg.get('gamma', 0.99)),
-            entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
-            entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
-            n_nests=int(nl_cfg.get('n_nests', 4)),
-            learn_eta=bool(nl_cfg.get('learn_eta', False)),
-            eta_init=float(nl_cfg.get('eta_init', 1.0)),
-            device=_nl_dev,
-            speed_function=speed_function,
-            log_metrics=True,
-            log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
-            metrics_dir='results/train_metrics',
-            metrics_tag='NL-HMARL-AC',
-            n_envs=int(nl_cfg.get('n_envs', 1)),
-        )
+        n_envs_cfg = int(nl_cfg.get('n_envs', 1))
+        if n_envs_cfg > 1:
+            print(f"[info] Using SubprocVecEnv with n_envs={n_envs_cfg} for NL-HMARL-AC")
+            from exp.trainers import train_nl_hmarl_ac_subproc
+            model = train_nl_hmarl_ac_subproc(
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
+                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                n_envs=n_envs_cfg,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL-AC',
+            )
+        else:
+            model = train_nl_hmarl_ac(
+                env_ctor=env_ctor,
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
+                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                speed_function=speed_function,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL-AC',
+                n_envs=int(nl_cfg.get('n_envs', 1)),
+            )
 
     # 规则分配器（静态环境用；动态环境由实验侧分配或简单就地导航）
     # 动态环境使用对应的任务池分配器（S-Shape/Return/Optimal）

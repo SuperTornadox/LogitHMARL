@@ -115,7 +115,7 @@ def evaluate_method(method_name: str,
                                speed_function=speed_function,
                                device=_dev)
     elif method_name in ('NL-HMARL', 'NLHMARL', 'NL_HMARL') and env_ctor is not None:
-        from exp.trainers import train_nl_hmarl
+        from exp.trainers import train_nl_hmarl, train_nl_hmarl_subproc
         nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
         _nl_dev = str(nl_cfg.get('device', 'cpu'))
         if _nl_dev.lower() == 'auto':
@@ -129,27 +129,49 @@ def evaluate_method(method_name: str,
                     _nl_dev = 'cpu'
             except Exception:
                 _nl_dev = 'cpu'
-        # Train on a fresh env with same config
-        model = train_nl_hmarl(
-            env_ctor=env_ctor,
-            env_config=cfg,
-            training_steps=training_steps,
-            hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
-            lr=float(nl_cfg.get('manager_lr', learning_rate)),
-            max_tasks=int(nl_cfg.get('max_tasks', 20)),
-            gamma=float(nl_cfg.get('gamma', 0.99)),
-            update_every=int(nl_cfg.get('update_every', 8)),
-            entropy_coef=float(nl_cfg.get('entropy_coef_manager', 0.01)),
-            n_nests=int(nl_cfg.get('n_nests', 4)),
-            learn_eta=bool(nl_cfg.get('learn_eta', False)),
-            eta_init=float(nl_cfg.get('eta_init', 1.0)),
-            device=_nl_dev,
-            speed_function=speed_function,
-            log_metrics=True,
-            log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
-            metrics_dir='results/train_metrics',
-            metrics_tag='NL-HMARL',
-        )
+        # Train on a fresh env with same config (use subproc vecenv if n_envs>1)
+        n_envs_cfg = int(nl_cfg.get('n_envs', 1))
+        if n_envs_cfg > 1:
+            model = train_nl_hmarl_subproc(
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr=float(nl_cfg.get('manager_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                n_envs=n_envs_cfg,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL',
+            )
+        else:
+            model = train_nl_hmarl(
+                env_ctor=env_ctor,
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr=float(nl_cfg.get('manager_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                update_every=int(nl_cfg.get('update_every', 8)),
+                entropy_coef=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                speed_function=speed_function,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL',
+                n_envs=1,
+            )
     elif method_name in ('NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC') and env_ctor is not None:
         from exp.trainers import train_nl_hmarl_ac
         nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
@@ -185,6 +207,7 @@ def evaluate_method(method_name: str,
             log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
             metrics_dir='results/train_metrics',
             metrics_tag='NL-HMARL-AC',
+            n_envs=int(nl_cfg.get('n_envs', 1)),
         )
 
     # 规则分配器（静态环境用；动态环境由实验侧分配或简单就地导航）

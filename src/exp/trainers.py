@@ -8,6 +8,7 @@ from exp.obs import get_agent_observation
 from exp.actions import get_valid_actions, convert_to_dynamic_actions
 from exp.assigners import assign_tasks_dynamic
 from exp.obs import get_global_state, get_task_features
+from exp.vecenv import SubprocVecEnv
 
 
 def train_flat_dqn(
@@ -74,14 +75,38 @@ def train_flat_dqn(
     for step in pbar:
         # 分配任务（关键）：为空闲拣货员分配可执行任务，避免永远没有拣/投事件
         assign_tasks_dynamic(env)
-        # 收集观测
+        # 收集观测（批量）
         obs_batch = [get_agent_observation(env, p, include_global=not pure_learning) for p in env.pickers]
-        # 选动作（与环境一致的索引空间: 0..3=UP/DOWN/LEFT/RIGHT, 4=IDLE, 5/6=PICK/DROP）
+        obs_tensor = torch.tensor(np.vstack(obs_batch), dtype=torch.float32, device=model.device)
+        # 有效动作掩码（批量）
+        masks = np.vstack([np.array(get_valid_actions(env, p), dtype=np.int32) for p in env.pickers])  # (N,7)
+        # 批量 Q 计算
+        with torch.no_grad():
+            q_vals = model.q_network(obs_tensor)  # (N,7) on device
+        q_np = q_vals.detach().cpu().numpy()
+        # 应用掩码：非法动作置为 -inf
+        q_np[masks == 0] = -np.inf
+        # epsilon-greedy（批量）：与原实现一致地每步推进 steps_done 按代理数
+        eps_start = getattr(model, 'epsilon_start', 1.0)
+        eps_end = getattr(model, 'epsilon_end', 0.05)
+        eps_decay = max(1, int(getattr(model, 'epsilon_decay', 100000)))
+        # 使用当前 steps_done 代表本步前的进度，近似所有代理同一 epsilon
+        cur_eps = eps_end + (eps_start - eps_end) * np.exp(-float(model.steps_done) / float(eps_decay))
+        explore = (np.random.rand(len(env.pickers)) < cur_eps)
         chosen_actions: Dict[int, int] = {}
-        for i, p in enumerate(env.pickers):
-            mask = np.array(get_valid_actions(env, p))
-            a = model.select_action(obs_batch[i], deterministic=False, action_mask=mask)
-            chosen_actions[i] = a
+        for i in range(len(env.pickers)):
+            if explore[i]:
+                valid_idx = np.where(masks[i] == 1)[0]
+                if len(valid_idx) == 0:
+                    chosen_actions[i] = int(np.argmax(q_np[i])) if np.all(np.isfinite(q_np[i])) else 4
+                else:
+                    chosen_actions[i] = int(np.random.choice(valid_idx))
+            else:
+                # 贪心选择（已屏蔽非法动作）
+                chosen_actions[i] = int(np.nanargmax(q_np[i])) if np.any(np.isfinite(q_np[i])) else 4
+        # 推进 epsilon 计数（按代理数），并更新缓存值
+        model.steps_done += len(env.pickers)
+        model.epsilon = eps_end + (eps_start - eps_end) * np.exp(-float(model.steps_done) / float(eps_decay))
         # 环境索引无需重排，仅将 5/6 归一为 4 下发
         env_actions = convert_to_dynamic_actions(chosen_actions, env, input_space='env')
         next_obs, rewards, dones, info = env.step(env_actions)
@@ -222,6 +247,8 @@ def train_nl_hmarl(
     log_every: int = 100,
     metrics_dir: str = 'results/train_metrics',
     metrics_tag: str = 'NL-HMARL',
+    # vectorized envs
+    n_envs: int = 1,
 ):
     """Train NL-HMARL manager with a simple A2C objective; workers use heuristic navigation during training.
 
@@ -240,19 +267,20 @@ def train_nl_hmarl(
     from exp.actions import smart_navigate, find_adjacent_accessible_position
     from env.dynamic_warehouse_env import TaskStatus
 
-    # Build training env
-    env = env_ctor(dict(env_config))
+    # Build training envs
     if speed_function is None:
         def speed_function(e):
             return {p.id: float(getattr(p, 'speed', 1.0)) for p in e.pickers}
-    env.set_speed_function(speed_function)
-    _ = env.reset()
+    envs = [env_ctor(dict(env_config)) for _ in range(max(1, int(n_envs)))]
+    for ev in envs:
+        ev.set_speed_function(speed_function)
+        ev.reset()
 
     # Dimensions
-    state_dim = int(get_global_state(env).shape[0])
+    state_dim = int(get_global_state(envs[0]).shape[0])
     worker_obs_dim = 45  # reuse agent obs with include_global=True
     worker_action_dim = 7
-    n_agents = env.n_pickers
+    n_agents = envs[0].n_pickers
     n_nests = 4
 
     model = NLHMARL(
@@ -274,102 +302,94 @@ def train_nl_hmarl(
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL', ncols=100)
     for step in pbar:
-        # Assign tasks to free pickers using current manager policy
-        state_vec = get_global_state(env)
-        task_feats = get_task_features(env, max_tasks=max_tasks, pending_only=True)
-        # Build nest ids and mask for current tasks
-        nest_ids = np.full((max_tasks,), -1, dtype=np.int64)
-        mask = np.zeros((max_tasks,), dtype=np.bool_)
-        pending_tasks = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
-        for i, t in enumerate(pending_tasks):
-            # Nest by forklift need: 1 if requires_car else 0
-            nest_ids[i] = 1 if bool(getattr(t, 'requires_car', False)) else 0
-            mask[i] = (t.status == TaskStatus.PENDING)
-
-        # One decision per free picker (greedy without collision)
-        free_pids = [i for i, p in enumerate(env.pickers) if p.current_task is None and len(p.carrying_items) == 0]
-        decisions = []  # tuples of (state, task_feats, nest_ids, mask, chosen_idx)
-        # Keep a local copy of mask to avoid picking the same task twice
-        local_mask = mask.copy()
-        for pid in free_pids:
-            if not local_mask.any():
-                break
-            s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
-            tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
-            nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-            m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
-            with torch.no_grad():
-                sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
-            idx = int(sel.item())
-            if not local_mask[idx]:
-                continue
-            # Map index to task object (pending slice)
-            t_list = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
-            if idx >= len(t_list):
-                continue
-            t = t_list[idx]
-            if not (t.status == TaskStatus.PENDING):
-                continue
-            # Assign
-            t.status = TaskStatus.ASSIGNED
-            t.assigned_picker = pid
-            env.pickers[pid].current_task = t
-            local_mask[idx] = False
-            decisions.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
-
-        # Build worker actions via simple navigation heuristic
-        actions = {}
-        for i, p in enumerate(env.pickers):
-            t = getattr(p, 'current_task', None)
-            if t is None:
-                actions[i] = 4
-                continue
-            if len(p.carrying_items) == 0:
-                if t.shelf_id is None or t.shelf_id >= len(env.shelves):
-                    actions[i] = 4
-                else:
-                    sh = env.shelves[t.shelf_id]
-                    adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
-                    if adj is None:
-                        actions[i] = 4
-                    elif (p.x, p.y) == adj or (abs(p.x - sh['x']) + abs(p.y - sh['y']) == 1):
+        # === Vectorized pass across envs ===
+        decisions_all = []
+        returns_all = []
+        cur_loss = float('nan'); cur_pl = float('nan'); cur_vl = float('nan'); cur_el = float('nan'); cur_ent = float('nan')
+        for env in envs:
+            state_vec = get_global_state(env)
+            task_feats = get_task_features(env, max_tasks=max_tasks, pending_only=True)
+            nest_ids = np.full((max_tasks,), -1, dtype=np.int64)
+            mask = np.zeros((max_tasks,), dtype=np.bool_)
+            pending_tasks = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
+            for i, t in enumerate(pending_tasks):
+                nest_ids[i] = 1 if bool(getattr(t, 'requires_car', False)) else 0
+                mask[i] = (t.status == TaskStatus.PENDING)
+            free_pids = [i for i, p in enumerate(env.pickers) if p.current_task is None and len(p.carrying_items) == 0]
+            local_mask = mask.copy()
+            decisions = []
+            for pid in free_pids:
+                if not local_mask.any():
+                    break
+                s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
+                tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
+                nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
+                with torch.no_grad():
+                    sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
+                idx = int(sel.item())
+                if not local_mask[idx]:
+                    continue
+                t_list = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
+                if idx >= len(t_list):
+                    continue
+                t = t_list[idx]
+                if not (t.status == TaskStatus.PENDING):
+                    continue
+                t.status = TaskStatus.ASSIGNED
+                t.assigned_picker = pid
+                env.pickers[pid].current_task = t
+                local_mask[idx] = False
+                decisions.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
+            # Heuristic actions and step
+            actions = {}
+            for i, p in enumerate(env.pickers):
+                t = getattr(p, 'current_task', None)
+                if t is None:
+                    actions[i] = 4; continue
+                if len(p.carrying_items) == 0:
+                    if t.shelf_id is None or t.shelf_id >= len(env.shelves):
                         actions[i] = 4
                     else:
-                        actions[i] = smart_navigate(p, adj, env)
-            else:
-                if t.station_id is None or t.station_id >= len(env.stations):
-                    actions[i] = 4
+                        sh = env.shelves[t.shelf_id]
+                        adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                        if adj is None or (p.x, p.y) == adj or (abs(p.x - sh['x']) + abs(p.y - sh['y']) == 1):
+                            actions[i] = 4
+                        else:
+                            actions[i] = smart_navigate(p, adj, env)
                 else:
-                    st = env.stations[t.station_id]
-                    actions[i] = 4 if abs(p.x - st['x']) + abs(p.y - st['y']) == 1 else smart_navigate(p, (st['x'], st['y']), env)
-
-        env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
-        _, rewards, _, _ = env.step(env_actions)
-        # Manager reward: sum of agent rewards
-        step_reward = float(sum(rewards.values())) if isinstance(rewards, dict) else float(rewards)
-
-        # TD(0) update for manager on the collected decisions
-        if decisions:
-            next_state_vec = get_global_state(env)
-            with torch.no_grad():
-                v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-            batch_states = torch.cat([d[0] for d in decisions], dim=0)
-            batch_tf = torch.cat([d[1] for d in decisions], dim=0)
-            batch_nid = torch.cat([d[2] for d in decisions], dim=0)
-            batch_mask = torch.cat([d[3] for d in decisions], dim=0)
-            batch_idx = torch.stack([d[4] for d in decisions], dim=0).to(model.device)
-            # Same reward for each manager choice within the step (simple credit assignment)
-            r = torch.full((len(decisions),), step_reward, dtype=torch.float32, device=model.device)
+                    if t.station_id is None or t.station_id >= len(env.stations):
+                        actions[i] = 4
+                    else:
+                        st = env.stations[t.station_id]
+                        actions[i] = 4 if abs(p.x - st['x']) + abs(p.y - st['y']) == 1 else smart_navigate(p, (st['x'], st['y']), env)
+            env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
+            _, rewards, _, _ = env.step(env_actions)
+            step_reward = float(sum(rewards.values())) if isinstance(rewards, dict) else float(rewards)
+            if decisions:
+                next_state_vec = get_global_state(env)
+                with torch.no_grad():
+                    v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0).item()
+                r = torch.full((len(decisions),), step_reward, dtype=torch.float32, device=model.device)
+                # Accumulate
+                decisions_all.extend(decisions)
+                returns_all.append(r + gamma * v_next)
+        # Single batched update across envs
+        if len(decisions_all) > 0:
+            batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
+            batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
+            batch_nid = torch.cat([d[2] for d in decisions_all], dim=0)
+            batch_mask = torch.cat([d[3] for d in decisions_all], dim=0)
+            batch_idx = torch.stack([d[4] for d in decisions_all], dim=0).to(model.device)
+            returns = torch.cat(returns_all, dim=0)
             with torch.no_grad():
                 v = model.value_net(batch_states).squeeze(-1)
-            returns = r + gamma * v_next.item()
             adv = returns - v
             loss_dict = model.compute_manager_loss(
                 batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
                 task_mask=batch_mask, entropy_coef=entropy_coef
             )
-            optim.zero_grad()
-            loss_dict['total_loss'].backward()
+            optim.zero_grad(); loss_dict['total_loss'].backward()
             torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
             optim.step()
             cur_loss = float(loss_dict['total_loss'].item())
@@ -378,11 +398,7 @@ def train_nl_hmarl(
             cur_el = float(loss_dict['entropy_loss'].item())
             cur_ent = float(loss_dict['entropy'].item())
         else:
-            cur_loss = float('nan')
-            cur_pl = float('nan')
-            cur_vl = float('nan')
-            cur_el = float('nan')
-            cur_ent = float('nan')
+            cur_loss = float('nan'); cur_pl = float('nan'); cur_vl = float('nan'); cur_el = float('nan'); cur_ent = float('nan')
 
         # Logging (buffer only; write CSV/PNG after training for lower overhead)
         if log_metrics and (step % max(1, log_every) == 0):
@@ -427,6 +443,175 @@ def train_nl_hmarl(
     return model
 
 
+def train_nl_hmarl_subproc(
+    *,
+    env_config: dict,
+    training_steps: int = 5000,
+    hidden_dim: int = 256,
+    lr: float = 1e-3,
+    max_tasks: int = 20,
+    gamma: float = 0.99,
+    entropy_coef: float = 0.01,
+    n_nests: int = 4,
+    learn_eta: bool = False,
+    eta_init: float = 1.0,
+    device: str = 'cpu',
+    n_envs: int = 4,
+    # logging
+    log_metrics: bool = True,
+    log_every: int = 100,
+    metrics_dir: str = 'results/train_metrics',
+    metrics_tag: str = 'NL-HMARL',
+):
+    import os
+    import torch
+    import numpy as np
+    from tqdm import tqdm
+    from baselines.nl_hmarl import NLHMARL
+
+    vec = SubprocVecEnv(int(max(2, n_envs)), env_config, max_tasks=max_tasks)
+    f0 = vec.get_features()[0]
+    state_dim = int(np.array(f0['state_vec'], dtype=np.float32).shape[0])
+
+    # Model
+    model = NLHMARL(
+        state_dim=state_dim,
+        n_tasks=max_tasks,
+        n_nests=n_nests,
+        worker_obs_dim=45,
+        worker_action_dim=7,
+        n_agents=int(env_config.get('n_pickers', 1)),
+        hidden_dim=hidden_dim,
+        device=device,
+        learn_eta=learn_eta,
+        eta_init=eta_init,
+    )
+    optim = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr)
+
+    # Logs
+    steps_log, loss_log, reward_log = [], [], []
+    pol_log, val_log, entL_log, ent_log = [], [], [], []
+    pbar = tqdm(range(training_steps), desc='Train NL-HMARL (subproc)', ncols=100)
+    for step in pbar:
+        feats_list = vec.get_features()
+        per_env_decisions = [[] for _ in range(len(feats_list))]
+        decisions_all = []
+        returns_all = []
+        # Build decisions
+        for ei, f in enumerate(feats_list):
+            state_vec = np.array(f['state_vec'], dtype=np.float32)
+            task_feats = np.array(f['task_feats'], dtype=np.float32)
+            task_ids = np.array(f['task_ids'], dtype=np.int64)
+            requires = np.array(f['requires'], dtype=np.bool_)
+            free_pids = list(np.array(f['free_pids'], dtype=np.int64))
+            T = int(task_feats.shape[0])
+            nest_ids = np.zeros((T,), dtype=np.int64)
+            nest_ids[:len(requires)] = requires.astype(np.int64)
+            mask = np.zeros((T,), dtype=bool)
+            mask[:len(task_ids)] = True
+            local_mask = mask.copy()
+            for pid in free_pids:
+                if not local_mask.any():
+                    break
+                s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
+                tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
+                nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
+                with torch.no_grad():
+                    sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
+                idx = int(sel.item())
+                if idx < 0 or idx >= len(task_ids) or not local_mask[idx]:
+                    continue
+                per_env_decisions[ei].append((int(pid), int(task_ids[idx])))
+                local_mask[idx] = False
+                decisions_all.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
+        # Step envs
+        outs = vec.step_with_decisions(per_env_decisions)
+        # Prepare returns
+        for ei, out in enumerate(outs):
+            if len(per_env_decisions[ei]) == 0:
+                continue
+            r = float(out.get('step_reward', 0.0))
+            nsv = np.array(out.get('next_state_vec'), dtype=np.float32)
+            with torch.no_grad():
+                v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
+            returns_all.append(torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next.item())
+        # Update manager
+        if len(decisions_all) > 0:
+            batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
+            batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
+            batch_nid = torch.cat([d[2] for d in decisions_all], dim=0)
+            batch_mask = torch.cat([d[3] for d in decisions_all], dim=0)
+            batch_idx = torch.stack([d[4] for d in decisions_all], dim=0).to(model.device)
+            returns = torch.cat(returns_all, dim=0)
+            with torch.no_grad():
+                v = model.value_net(batch_states).squeeze(-1)
+            adv = returns - v
+            loss_dict = model.compute_manager_loss(batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
+                                                   task_mask=batch_mask, entropy_coef=entropy_coef)
+            optim.zero_grad(); loss_dict['total_loss'].backward()
+            torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
+            optim.step()
+            cur_loss = float(loss_dict['total_loss'].item())
+            cur_pl = float(loss_dict['policy_loss'].item())
+            cur_vl = float(loss_dict['value_loss'].item())
+            cur_el = float(loss_dict['entropy_loss'].item())
+            cur_ent = float(loss_dict['entropy'].item())
+        else:
+            cur_loss = float('nan'); cur_pl = float('nan'); cur_vl = float('nan'); cur_el = float('nan'); cur_ent = float('nan')
+
+        # Logging buffer
+        if log_metrics and (step % max(1, log_every) == 0):
+            steps_log.append(step)
+            loss_log.append(cur_loss)
+            try:
+                mean_rew = float(np.mean([float(o.get('step_reward', 0.0)) for o in outs]))
+            except Exception:
+                mean_rew = 0.0
+            reward_log.append(mean_rew)
+            pol_log.append(cur_pl); val_log.append(cur_vl); entL_log.append(cur_el); ent_log.append(cur_ent)
+        try:
+            pbar.set_postfix(rew=f"{mean_rew:.2f}", loss=f"{(cur_loss if np.isfinite(cur_loss) else 0):.3f}")
+        except Exception:
+            pass
+
+    # Save metrics after training
+    if log_metrics:
+        try:
+            out_dir = os.path.join(metrics_dir or 'results/train_metrics', metrics_tag or 'NL-HMARL')
+            os.makedirs(out_dir, exist_ok=True)
+            import pandas as pd
+            import matplotlib.pyplot as plt
+            df = pd.DataFrame({
+                'step': steps_log,
+                'loss': loss_log,
+                'step_reward': reward_log,
+                'policy_loss': pol_log,
+                'value_loss': val_log,
+                'entropy_loss': entL_log,
+                'entropy': ent_log,
+            })
+            df.to_csv(os.path.join(out_dir, 'metrics.csv'), index=False)
+            if len(steps_log) > 0:
+                plt.figure(figsize=(7, 4))
+                plt.plot(steps_log, pol_log, label='policy_loss')
+                plt.plot(steps_log, val_log, label='value_loss')
+                plt.plot(steps_log, entL_log, label='entropy_loss')
+                plt.legend(fontsize=8)
+                plt.xlabel('step'); plt.ylabel('loss'); plt.title(f'{metrics_tag} Manager Loss Components')
+                plt.grid(alpha=0.3); plt.tight_layout()
+                plt.savefig(os.path.join(out_dir, 'manager_losses.png'))
+                plt.close()
+        except Exception as e:
+            print(f"[warn] Failed to save NL-HMARL (subproc) metrics: {e}")
+    # Close vecenv
+    try:
+        vec.close()
+    except Exception:
+        pass
+    return model
+
+
 def train_nl_hmarl_ac(
     *,
     env_ctor,
@@ -449,6 +634,8 @@ def train_nl_hmarl_ac(
     log_every: int = 100,
     metrics_dir: str = 'results/train_metrics',
     metrics_tag: str = 'NL-HMARL-AC',
+    # vectorized envs
+    n_envs: int = 1,
 ):
     """Train NL-HMARL with Actor-Critic workers.
 
@@ -464,18 +651,19 @@ def train_nl_hmarl_ac(
     from exp.obs import get_agent_observation
     from env.dynamic_warehouse_env import TaskStatus
 
-    env = env_ctor(dict(env_config))
     if speed_function is None:
         def speed_function(e):
-            return {p.id: float(getattr(p, 'speed', 1.0)) for p in e.pickers}
-    env.set_speed_function(speed_function)
-    _ = env.reset()
+            return {p.id: float(getattr(e, 'speed', 1.0)) for p in e.pickers}
+    envs = [env_ctor(dict(env_config)) for _ in range(max(1, int(n_envs)))]
+    for ev in envs:
+        ev.set_speed_function(speed_function)
+        ev.reset()
 
     # Dimensions
-    state_dim = int(get_global_state(env).shape[0])
+    state_dim = int(get_global_state(envs[0]).shape[0])
     worker_obs_dim = 45
     worker_action_dim = 7
-    n_agents = env.n_pickers
+    n_agents = envs[0].n_pickers
     n_nests = 4
 
     model = NLHMARL(
@@ -498,101 +686,111 @@ def train_nl_hmarl_ac(
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC', ncols=100)
 
     for step in pbar:
-        # 1) Manager assigns tasks to free pickers
-        state_vec = get_global_state(env)
-        task_feats = get_task_features(env, max_tasks=max_tasks, pending_only=True)
-        nest_ids = np.full((max_tasks,), -1, dtype=np.int64)
-        mask = np.zeros((max_tasks,), dtype=np.bool_)
-        t_list = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
-        for i, t in enumerate(t_list):
-            # Nest by forklift need: 1 if requires_car else 0
-            nest_ids[i] = 1 if bool(getattr(t, 'requires_car', False)) else 0
-            mask[i] = (t.status == TaskStatus.PENDING)
-
-        free_pids = [i for i, p in enumerate(env.pickers) if p.current_task is None and len(p.carrying_items) == 0]
-        decisions = []
-        local_mask = mask.copy()
-        for pid in free_pids:
-            if not local_mask.any():
-                break
-            s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
-            tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
-            nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-            m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
+        # Accumulators across envs
+        decisions_all = []
+        returns_all = []
+        obs_all = []
+        actions_all = []
+        rewards_all = []
+        dones_all = []
+        # Per-env pass
+        for env in envs:
+            state_vec = get_global_state(env)
+            task_feats = get_task_features(env, max_tasks=max_tasks, pending_only=True)
+            nest_ids = np.full((max_tasks,), -1, dtype=np.int64)
+            mask = np.zeros((max_tasks,), dtype=np.bool_)
+            t_list = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
+            for i, t in enumerate(t_list):
+                nest_ids[i] = 1 if bool(getattr(t, 'requires_car', False)) else 0
+                mask[i] = (t.status == TaskStatus.PENDING)
+            free_pids = [i for i, p in enumerate(env.pickers) if p.current_task is None and len(p.carrying_items) == 0]
+            local_mask = mask.copy()
+            decisions = []
+            for pid in free_pids:
+                if not local_mask.any():
+                    break
+                s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
+                tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
+                nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
+                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
+                with torch.no_grad():
+                    sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
+                idx = int(sel.item())
+                if not local_mask[idx] or idx >= len(t_list):
+                    continue
+                t = t_list[idx]
+                if t.status != TaskStatus.PENDING:
+                    continue
+                t.status = TaskStatus.ASSIGNED
+                t.assigned_picker = pid
+                env.pickers[pid].current_task = t
+                local_mask[idx] = False
+                decisions.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
+            # Workers act
+            obs_batch = [get_agent_observation(env, p, include_global=True) for p in env.pickers]
+            obs_tensor = torch.tensor(np.vstack(obs_batch), dtype=torch.float32, device=model.device)
+            out = model.workers(obs_tensor)
             with torch.no_grad():
-                sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
-            idx = int(sel.item())
-            if not local_mask[idx] or idx >= len(t_list):
-                continue
-            t = t_list[idx]
-            if t.status != TaskStatus.PENDING:
-                continue
-            t.status = TaskStatus.ASSIGNED
-            t.assigned_picker = pid
-            env.pickers[pid].current_task = t
-            local_mask[idx] = False
-            decisions.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
-
-        # 2) Workers select actions via shared policy
-        obs_batch = [get_agent_observation(env, p, include_global=True) for p in env.pickers]
-        obs_tensor = torch.tensor(np.vstack(obs_batch), dtype=torch.float32, device=model.device)
-        out = model.workers(obs_tensor)
-        action_probs = out['action_probs']  # [N,7]
-        values = out['value']               # [N]
-        # Sample actions from probs
-        with torch.no_grad():
-            actions_idx = torch.multinomial(torch.clamp(action_probs, min=1e-8), num_samples=1).squeeze(1)
-        # Sanitize invalid moves (avoid shelves/out-of-bounds). If invalid, try to navigate to goal or idle.
-        actions = {}
-        for i, p in enumerate(env.pickers):
-            a = int(actions_idx[i].item())
-            if a in (0, 1, 2, 3):
-                dd = {0: (0, -1), 1: (0, 1), 2: (-1, 0), 3: (1, 0)}[a]
-                nx, ny = p.x + dd[0], p.y + dd[1]
-                invalid = not (0 <= nx < env.width and 0 <= ny < env.height) or (env.grid[ny, nx] == 2)
-                if invalid:
-                    t = getattr(p, 'current_task', None)
-                    target = None
-                    if t is not None:
-                        if p.carrying_items and t.station_id is not None and t.station_id < len(env.stations):
-                            st = env.stations[t.station_id]
-                            target = (st['x'], st['y'])
-                        elif (not p.carrying_items) and t.shelf_id is not None and t.shelf_id < len(env.shelves):
-                            sh = env.shelves[t.shelf_id]
-                            adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
-                            target = adj if adj is not None else (sh['x'], sh['y'])
-                    if target is not None:
-                        a = smart_navigate(p, target, env)
-                    else:
-                        a = 4
-            actions[i] = a
-        env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
-
-        # 3) Step env
-        _, rewards, dones, _ = env.step(env_actions)
-        step_rew = float(sum(rewards.values())) if isinstance(rewards, dict) else float(rewards)
-
-        # 4) Manager update (TD(0) on aggregated reward)
-        if decisions:
-            next_state_vec = get_global_state(env)
-            with torch.no_grad():
-                v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-            batch_states = torch.cat([d[0] for d in decisions], dim=0)
-            batch_tf = torch.cat([d[1] for d in decisions], dim=0)
-            batch_nid = torch.cat([d[2] for d in decisions], dim=0)
-            batch_mask = torch.cat([d[3] for d in decisions], dim=0)
-            batch_idx = torch.stack([d[4] for d in decisions], dim=0).to(model.device)
-            r = torch.full((len(decisions),), step_rew, dtype=torch.float32, device=model.device)
+                actions_idx = torch.multinomial(torch.clamp(out['action_probs'], min=1e-8), num_samples=1).squeeze(1)
+            actions = {}
+            for i, p in enumerate(env.pickers):
+                a = int(actions_idx[i].item())
+                if a in (0, 1, 2, 3):
+                    dd = {0: (0, -1), 1: (0, 1), 2: (-1, 0), 3: (1, 0)}[a]
+                    nx, ny = p.x + dd[0], p.y + dd[1]
+                    invalid = not (0 <= nx < env.width and 0 <= ny < env.height) or (env.grid[ny, nx] == 2)
+                    if invalid:
+                        t = getattr(p, 'current_task', None)
+                        target = None
+                        if t is not None:
+                            if p.carrying_items and t.station_id is not None and t.station_id < len(env.stations):
+                                st = env.stations[t.station_id]; target = (st['x'], st['y'])
+                            elif (not p.carrying_items) and t.shelf_id is not None and t.shelf_id < len(env.shelves):
+                                sh = env.shelves[t.shelf_id]
+                                adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                                target = adj if adj is not None else (sh['x'], sh['y'])
+                        if target is not None:
+                            a = smart_navigate(p, target, env)
+                        else:
+                            a = 4
+                actions[i] = a
+            env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
+            _, rewards, dones, _ = env.step(env_actions)
+            # Accumulate buffers for batched updates
+            if decisions:
+                next_state_vec = get_global_state(env)
+                with torch.no_grad():
+                    v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0).item()
+                step_rew = float(sum(rewards.values())) if isinstance(rewards, dict) else float(rewards)
+                r = torch.full((len(decisions),), step_rew, dtype=torch.float32, device=model.device)
+                decisions_all.extend(decisions)
+                returns_all.append(r + gamma * v_next)
+            obs_all.append(obs_tensor)
+            actions_all.append(torch.tensor([actions[i] for i in range(n_agents)], dtype=torch.long, device=model.device))
+            # Reward/done vectors for worker A2C
+            if isinstance(rewards, dict):
+                r_vec = torch.tensor([float(rewards.get(i, 0.0)) for i in range(n_agents)], dtype=torch.float32, device=model.device)
+                d_vec = torch.tensor([1.0 if dones.get(i, False) else 0.0 for i in range(n_agents)], dtype=torch.float32, device=model.device)
+            else:
+                r_avg = float(rewards) / max(1, n_agents)
+                r_vec = torch.full((n_agents,), r_avg, dtype=torch.float32, device=model.device)
+                d_vec = torch.zeros((n_agents,), dtype=torch.float32, device=model.device)
+            rewards_all.append(r_vec)
+            dones_all.append(d_vec)
+        # Manager batched update
+        if len(decisions_all) > 0:
+            batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
+            batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
+            batch_nid = torch.cat([d[2] for d in decisions_all], dim=0)
+            batch_mask = torch.cat([d[3] for d in decisions_all], dim=0)
+            batch_idx = torch.stack([d[4] for d in decisions_all], dim=0).to(model.device)
+            returns = torch.cat(returns_all, dim=0)
             with torch.no_grad():
                 v = model.value_net(batch_states).squeeze(-1)
-            returns = r + gamma * v_next.item()
             adv = returns - v
-            m_losses = model.compute_manager_loss(
-                batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
-                task_mask=batch_mask, entropy_coef=entropy_coef_manager
-            )
-            opt_manager.zero_grad()
-            m_losses['total_loss'].backward()
+            m_losses = model.compute_manager_loss(batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
+                                                 task_mask=batch_mask, entropy_coef=entropy_coef_manager)
+            opt_manager.zero_grad(); m_losses['total_loss'].backward()
             torch.nn.utils.clip_grad_norm_(list(model.manager.parameters()) + list(model.value_net.parameters()), 1.0)
             opt_manager.step()
             cur_m_loss = float(m_losses['total_loss'].item())
@@ -601,42 +799,35 @@ def train_nl_hmarl_ac(
             cur_m_el = float(m_losses['entropy_loss'].item())
             cur_m_ent = float(m_losses['entropy'].item())
         else:
-            cur_m_loss = float('nan')
-            cur_m_pl = float('nan')
-            cur_m_vl = float('nan')
-            cur_m_el = float('nan')
-            cur_m_ent = float('nan')
-
-        # 5) Workers update (A2C)
-        next_obs_batch = [get_agent_observation(env, p, include_global=True) for p in env.pickers]
-        next_obs_tensor = torch.tensor(np.vstack(next_obs_batch), dtype=torch.float32, device=model.device)
-        with torch.no_grad():
-            next_vals = model.workers(next_obs_tensor)['value']  # [N]
-        # Gather log_probs for executed actions (after sanitization)
-        # Recompute forward to align probabilities with executed actions
-        out2 = model.workers(obs_tensor)
-        log_probs_all = torch.log(torch.clamp(out2['action_probs'], min=1e-8))
-        exec_actions = torch.tensor([actions[i] for i in range(n_agents)], dtype=torch.long, device=model.device)
-        act_logp = log_probs_all.gather(1, exec_actions.unsqueeze(1)).squeeze(1)
-        values2 = out2['value']
-        # Build per-agent rewards vector
-        if isinstance(rewards, dict):
-            r_vec = torch.tensor([float(rewards.get(i, 0.0)) for i in range(n_agents)], dtype=torch.float32, device=model.device)
+            cur_m_loss = float('nan'); cur_m_pl = float('nan'); cur_m_vl = float('nan'); cur_m_el = float('nan'); cur_m_ent = float('nan')
+        # Workers batched update
+        if len(obs_all) > 0:
+            obs_b = torch.cat(obs_all, dim=0)
+            actions_b = torch.cat(actions_all, dim=0)
+            out2 = model.workers(obs_b)
+            log_probs_all = torch.log(torch.clamp(out2['action_probs'], min=1e-8))
+            act_logp = log_probs_all.gather(1, actions_b.unsqueeze(1)).squeeze(1)
+            # Next values
+            next_obs_all = []
+            for env in envs:
+                next_obs_all.extend([get_agent_observation(env, p, include_global=True) for p in env.pickers])
+            next_obs_tensor = torch.tensor(np.vstack(next_obs_all), dtype=torch.float32, device=model.device)
+            with torch.no_grad():
+                next_vals = model.workers(next_obs_tensor)['value']
+            r_vec = torch.cat(rewards_all, dim=0)
+            d_vec = torch.cat(dones_all, dim=0)
+            returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+            adv_w = returns_w - out2['value']
+            policy_loss = -(adv_w.detach() * act_logp).mean()
+            value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+            entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
+            total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
+            opt_workers.zero_grad(); total_w_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.workers.parameters(), 1.0)
+            opt_workers.step()
+            cur_w_loss = float(total_w_loss.item())
         else:
-            r_avg = float(rewards) / max(1, n_agents)
-            r_vec = torch.full((n_agents,), r_avg, dtype=torch.float32, device=model.device)
-        done_vec = torch.tensor([1.0 if (isinstance(dones, dict) and dones.get(i, False)) else 0.0 for i in range(n_agents)], dtype=torch.float32, device=model.device)
-        returns_w = r_vec + gamma * next_vals * (1.0 - done_vec)
-        adv_w = returns_w - values2
-        policy_loss = -(adv_w.detach() * act_logp).mean()
-        value_loss = torch.nn.functional.mse_loss(values2, returns_w.detach())
-        entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
-        total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
-        opt_workers.zero_grad()
-        total_w_loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.workers.parameters(), 1.0)
-        opt_workers.step()
-        cur_w_loss = float(total_w_loss.item())
+            cur_w_loss = float('nan')
 
         # 6) Logging (buffer only; write CSV/PNG after training)
         if log_metrics and (step % max(1, log_every) == 0):

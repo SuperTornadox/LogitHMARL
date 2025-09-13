@@ -793,6 +793,7 @@ def train_nl_hmarl_subproc(
 
     # Logs
     steps_log, loss_log, reward_log = [], [], []
+    env_steps_log = []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL (subproc)', ncols=100)
     import time as _time

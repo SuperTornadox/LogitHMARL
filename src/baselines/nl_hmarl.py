@@ -117,7 +117,8 @@ class NLManager(nn.Module):
                     p_in = exps / denom
                     p_task[idx] = p_nest[m] * p_in
             # If all tasks masked, fall back to uniform over masked ones
-            if mask.any() and float(p_task.sum()) <= 1e-12:
+            # Convert tensors to Python scalars safely (detach to avoid autograd warnings)
+            if bool(mask.any().detach().item()) and (p_task.sum().detach().item() <= 1e-12):
                 p_task[mask] = 1.0 / mask.float().sum()
             task_probs.append(p_task)
             nest_probs.append(p_nest)

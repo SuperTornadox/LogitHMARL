@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 from typing import Dict, List, Any, Tuple
 
 
@@ -372,21 +373,23 @@ class BatchTensorWarehouseEnv:
                     best_a = 4
                 actions[b, i] = best_a
 
-        # 计算每个拣货员的“本步可移动格数”（速度），并按方向执行多步移动
-        # 速度 = base_speed(type) * weight_term(task_weight) * (1 - congestion_red) * carry_alpha(若携带)
-        base_speed = torch.where(self.picker_is_forklift, torch.full((B, N), self.base_speed_fork, device=self.device), torch.full((B, N), self.base_speed_reg, device=self.device))
-        # 任务权重（若无任务则视为 0 → weight_term≈1）
-        wt = torch.zeros((B, N), dtype=torch.float32, device=self.device)
-        for b in range(B):
-            for i in range(N):
-                tid = int(self.current_task_idx[b, i].item())
-                if tid >= 0:
-                    wt[b, i] = float(self.task_weight[b, tid].item()) if hasattr(self, 'task_weight') else 0.0
-        thr_base = self.wt_forklift_only if self.wt_forklift_only is not None else self.wt_heavy
-        weight_term = torch.clamp((thr_base - wt + 10.0) / max(1e-6, (thr_base + 10.0)), 0.0, 2.0)
+        # 计算每个拣货员的“本步可移动格数”（速度）
+        base_speed = torch.where(self.picker_is_forklift,
+                                 torch.full((B, N), self.base_speed_fork, device=self.device),
+                                 torch.full((B, N), self.base_speed_reg, device=self.device))
+        # 任务权重 gather
+        tid_mat = self.current_task_idx.clone()
+        tid_safe = torch.clamp(tid_mat, min=0)
+        task_w = self.task_weight  # (B,T)
+        wt = torch.gather(task_w, 1, tid_safe)
+        wt = torch.where(tid_mat >= 0, wt, torch.zeros_like(wt))
+        thr_base = torch.full_like(wt, self.wt_forklift_only)
+        weight_term = torch.clamp((thr_base - wt + 10.0) / torch.clamp(thr_base + 10.0, min=1e-6), 0.0, 2.0)
         congest = torch.full((B, N), self.congestion_red, device=self.device)
         eff = weight_term * (1.0 - congest)
-        carry_alpha = torch.where(self.picker_is_forklift, torch.full((B, N), self.carry_alpha_fork, device=self.device), torch.full((B, N), self.carry_alpha_reg, device=self.device))
+        carry_alpha = torch.where(self.picker_is_forklift,
+                                  torch.full((B, N), self.carry_alpha_fork, device=self.device),
+                                  torch.full((B, N), self.carry_alpha_reg, device=self.device))
         eff = torch.where(self.carrying, eff * carry_alpha, eff)
         speed = base_speed * eff
         steps_int = torch.clamp(torch.floor(speed), min=0).to(torch.long)
@@ -394,32 +397,127 @@ class BatchTensorWarehouseEnv:
         extra = (torch.rand_like(frac) < frac).to(torch.long)
         steps_to_move = steps_int + extra
 
-        # Apply actions（多步移动）并计算奖励
+        # 目标坐标（按当前是否携带选择 shelf/station）
+        shelf_x = torch.gather(self.task_shelf[:, :, 0], 1, tid_safe)
+        shelf_y = torch.gather(self.task_shelf[:, :, 1], 1, tid_safe)
+        station_x = torch.gather(self.task_station[:, :, 0], 1, tid_safe)
+        station_y = torch.gather(self.task_station[:, :, 1], 1, tid_safe)
+        tgt_x = torch.where(self.carrying, station_x, shelf_x)
+        tgt_y = torch.where(self.carrying, station_y, shelf_y)
+        tgt_x = torch.where(tid_mat >= 0, tgt_x, self.picker_xy[:, :, 0].long())
+        tgt_y = torch.where(tid_mat >= 0, tgt_y, self.picker_xy[:, :, 1].long())
+
+        # 向量化多步移动
         rewards = torch.zeros((B, N), dtype=torch.float32, device=self.device)
-        for b in range(B):
-            for i in range(N):
-                a = int(actions[b, i].item())
-                px = int(self.picker_xy[b, i, 0].item()); py = int(self.picker_xy[b, i, 1].item())
-                if a < 4:
-                    # 朝目标更近奖励：比较 old_dist 与 new_dist
-                    tid = int(self.current_task_idx[b, i].item())
-                    tgtx = tgty = None
-                    if tid >= 0:
-                        tgt = self.task_shelf[b, tid] if not self.carrying[b, i] else self.task_station[b, tid]
-                        tgtx = int(tgt[0].item()); tgty = int(tgt[1].item())
-                    smax = int(steps_to_move[b, i].item())
-                    for _ in range(max(1, smax)):
-                        nx = px + int(dir_xy[a, 0].item()); ny = py + int(dir_xy[a, 1].item())
-                        if nx < 0 or ny < 0 or nx >= W or ny >= H or bool(self.obstacle[b, ny, nx]):
-                            break
-                        old_dist = abs(px - (tgtx if tgtx is not None else px)) + abs(py - (tgty if tgty is not None else py)) if tid >= 0 else 0
-                        px, py = nx, ny
-                        new_dist = abs(px - (tgtx if tgtx is not None else px)) + abs(py - (tgty if tgty is not None else py)) if tid >= 0 else 0
-                        if tid >= 0 and new_dist < old_dist:
-                            rewards[b, i] += float(self.rew_cfg.get('move_toward_target', self.rew_cfg.get('move_bonus', 0.05)))
-                    self.picker_xy[b, i, 0] = px
-                    self.picker_xy[b, i, 1] = py
-                else:
+        cur_x = self.picker_xy[:, :, 0].long().clone()
+        cur_y = self.picker_xy[:, :, 1].long().clone()
+        # 动作对应的位移
+        dxv = torch.tensor([0, 0, -1, 1, 0], device=self.device)
+        dyv = torch.tensor([-1, 1, 0, 0, 0], device=self.device)
+        dx_act = dxv[actions]
+        dy_act = dyv[actions]
+        max_steps = int(steps_to_move.max().item()) if B * N > 0 else 0
+        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        for s in range(max_steps):
+            alive = (actions < 4) & (steps_to_move > s)
+            if not bool(alive.any().detach().item()):
+                break
+            nx = cur_x + dx_act
+            ny = cur_y + dy_act
+            inb = (nx >= 0) & (ny >= 0) & (nx < W) & (ny < H)
+            obs = self.obstacle[b_idx, ny.clamp(0, H - 1), nx.clamp(0, W - 1)]
+            ok = alive & inb & (~obs)
+            # 朝目标更近奖励
+            old_dist = (cur_x - tgt_x).abs() + (cur_y - tgt_y).abs()
+            new_dist = (nx.clamp(0, W - 1) - tgt_x).abs() + (ny.clamp(0, H - 1) - tgt_y).abs()
+            improve = ok & (new_dist < old_dist)
+            rewards = rewards + improve.float() * float(self.rew_cfg.get('move_toward_target', self.rew_cfg.get('move_bonus', 0.05)))
+            cur_x = torch.where(ok, nx.clamp(0, W - 1), cur_x)
+            cur_y = torch.where(ok, ny.clamp(0, H - 1), cur_y)
+        self.picker_xy[:, :, 0] = cur_x
+        self.picker_xy[:, :, 1] = cur_y
+
+        # 向量化 Pick/Drop（IDLE 且相邻触发）
+        idle_mask = (actions == 4)
+        has_task = (tid_mat := self.current_task_idx).ge(0)
+        px = self.picker_xy[:, :, 0].long(); py = self.picker_xy[:, :, 1].long()
+        # 相邻 shelf/station
+        shx = torch.gather(self.task_shelf[:, :, 0], 1, tid_safe)
+        shy = torch.gather(self.task_shelf[:, :, 1], 1, tid_safe)
+        stx = torch.gather(self.task_station[:, :, 0], 1, tid_safe)
+        sty = torch.gather(self.task_station[:, :, 1], 1, tid_safe)
+        adj_shelf = (px - shx).abs() + (py - shy).abs() == 1
+        adj_station = (px - stx).abs() + (py - sty).abs() == 1
+        # Pick：idle & ~carrying & has_task & adj_shelf
+        can_pick = idle_mask & (~self.carrying) & has_task & adj_shelf
+        req = torch.gather(self.task_req_car, 1, tid_safe)
+        req = torch.where(has_task, req, torch.zeros_like(req))
+        allowed_pick = can_pick & (~req | self.picker_is_forklift)
+        disallowed_pick = can_pick & req & (~self.picker_is_forklift)
+        # pick reward 按类别与类型缩放
+        w = torch.gather(self.task_weight, 1, tid_safe)
+        cls_fk = (w >= self.wt_forklift_only)
+        cls_hv = (w >= self.wt_heavy) & (w < self.wt_forklift_only)
+        cls_md = (w >= self.wt_medium) & (w < self.wt_heavy)
+        cls_lt = (w < self.wt_medium)
+        cfg_rw = self.cfg.get('reward_config', {})
+        pick_base = cfg_rw.get('pick_base', {'forklift_only': 4.0, 'heavy': 3.0, 'medium': 2.0, 'light': 1.0})
+        pb = (torch.full_like(w, float(pick_base.get('forklift_only', 4.0))) * cls_fk.float() +
+              torch.full_like(w, float(pick_base.get('heavy', 3.0))) * cls_hv.float() +
+              torch.full_like(w, float(pick_base.get('medium', 2.0))) * cls_md.float() +
+              torch.full_like(w, float(pick_base.get('light', 1.0))) * cls_lt.float())
+        fork_eff = cfg_rw.get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
+        reg_eff = cfg_rw.get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
+        fe = (torch.full_like(w, float(fork_eff.get('forklift_only', 2.0))) * cls_fk.float() +
+              torch.full_like(w, float(fork_eff.get('heavy', 1.8))) * cls_hv.float() +
+              torch.full_like(w, float(fork_eff.get('medium', 1.2))) * cls_md.float() +
+              torch.full_like(w, float(fork_eff.get('light', 1.1))) * cls_lt.float())
+        re = (torch.full_like(w, float(reg_eff.get('forklift_only', 0.0))) * cls_fk.float() +
+              torch.full_like(w, float(reg_eff.get('heavy', 1.0))) * cls_hv.float() +
+              torch.full_like(w, float(reg_eff.get('medium', 1.0))) * cls_md.float() +
+              torch.full_like(w, float(reg_eff.get('light', 1.0))) * cls_lt.float())
+        eff_sel = torch.where(self.picker_is_forklift, fe, re)
+        pick_reward_mat = pb * eff_sel
+        rewards = rewards + torch.where(allowed_pick, pick_reward_mat.float(), torch.zeros_like(pick_reward_mat))
+        rewards = rewards + torch.where(disallowed_pick, torch.full_like(pick_reward_mat, -0.5), torch.zeros_like(pick_reward_mat))
+        self.carrying = torch.where(allowed_pick, torch.ones_like(self.carrying), self.carrying)
+        # Drop：idle & carrying & has_task & adj_station
+        can_drop = idle_mask & self.carrying & has_task & adj_station
+        base_val = torch.gather(self.task_value_base, 1, tid_safe)
+        D = torch.gather(self.task_deadline_abs, 1, tid_safe)
+        cur_t = self.current_time.view(B, 1).expand(B, N)
+        val = torch.where(cur_t <= D, base_val,
+                          torch.where(cur_t < 2 * D, base_val * (2 * D - cur_t) / torch.clamp(D, min=1e-6), torch.zeros_like(base_val)))
+        drop_base = cfg_rw.get('drop_base', {'forklift_only': 5.0, 'heavy': 4.0, 'medium': 2.5, 'light': 1.5})
+        db = (torch.full_like(w, float(drop_base.get('forklift_only', 5.0))) * cls_fk.float() +
+              torch.full_like(w, float(drop_base.get('heavy', 4.0))) * cls_hv.float() +
+              torch.full_like(w, float(drop_base.get('medium', 2.5))) * cls_md.float() +
+              torch.full_like(w, float(drop_base.get('light', 1.5))) * cls_lt.float())
+        drop_reward_mat = db * eff_sel + val
+        rewards = rewards + torch.where(can_drop, drop_reward_mat.float(), torch.zeros_like(drop_reward_mat))
+        late_pen = torch.where(cur_t > D, torch.full_like(val, float(self.rew_cfg.get('late_penalty', -5.0))), torch.zeros_like(val))
+        rewards = rewards + torch.where(can_drop, late_pen, torch.zeros_like(late_pen))
+        # 完成任务状态更新
+        done_mask = can_drop
+        # 更新 task_status 到 2
+        # 将 (B,N) 标量 drop 对应的 (B,T) 索引位置设置为 2
+        if bool(done_mask.any().detach().item()):
+            # 为每个 (b,i) 取 tid_safe[b,i]
+            b_lin = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+            tid_lin = tid_safe
+            # 仅对 done 的位置赋值
+            self.task_status[b_lin[done_mask], tid_lin[done_mask]] = 2
+            self.task_assigned[b_lin[done_mask], tid_lin[done_mask]] = -1
+            # 当前拣货员清空任务 & 取消携带
+            self.current_task_idx[done_mask] = -1
+            self.carrying[done_mask] = False
+            # 统计
+            inc = done_mask.float().sum(dim=1).long()
+            self.total_tasks_completed += inc
+            self.total_orders_completed += inc
+            self.on_time_completions += ((cur_t <= D) & done_mask).float().sum(dim=1).long()
+        # Idle 惩罚（统一累加）
+        rewards = rewards + torch.where(actions == 4, torch.full_like(rewards, self.rew_cfg['idle_penalty']), torch.zeros_like(rewards))
                     # IDLE: try pick/drop
                     tid = self.current_task_idx[b, i].item()
                     if tid >= 0:
@@ -476,18 +574,15 @@ class BatchTensorWarehouseEnv:
         self.battery = self.battery - torch.where(moved_mask, torch.full_like(self.battery, 0.1), torch.full_like(self.battery, 0.05))
         low = self.battery < 20.0
         rewards = rewards + (low.float() * self.rew_cfg['battery_low_penalty'])
-        # Congestion: penalty if >1 other pickers within manhattan 1
-        for b in range(B):
-            for i in range(N):
-                px = int(self.picker_xy[b, i, 0].item()); py = int(self.picker_xy[b, i, 1].item())
-                crowd = 0
-                for j in range(N):
-                    if j == i: continue
-                    ox = int(self.picker_xy[b, j, 0].item()); oy = int(self.picker_xy[b, j, 1].item())
-                    if abs(ox - px) + abs(oy - py) <= 1:
-                        crowd += 1
-                if crowd > 1:
-                    rewards[b, i] += -0.5
+        # Congestion penalty via convolution (8-neighborhood)
+        occ_flat = torch.zeros((B, H * W), dtype=torch.float32, device=self.device)
+        idx_flat = (self.picker_xy[:, :, 1].long() * W + self.picker_xy[:, :, 0].long()).clamp(0, H * W - 1)
+        occ_flat.scatter_add_(1, idx_flat, torch.ones_like(idx_flat, dtype=torch.float32))
+        occ = occ_flat.view(B, 1, H, W)
+        nb = F.conv2d(occ, torch.ones((1, 1, 3, 3), device=self.device), padding=1) - occ
+        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        neigh = nb.squeeze(1)[b_idx, self.picker_xy[:, :, 1].long(), self.picker_xy[:, :, 0].long()]
+        rewards = rewards + (neigh.ge(1.0).float() * -0.5)
         # 区域均衡（全局奖励，按人头均摊）
         total = self.zone_loads.sum(dim=1)
         # 使用标准差作为不均衡度量，参考 CPU 版条件
@@ -600,17 +695,15 @@ class BatchTensorWarehouseEnv:
         self.battery = self.battery - torch.where(moved_mask, torch.full_like(self.battery, 0.1), torch.full_like(self.battery, 0.05))
         low = self.battery < 20.0
         rewards = rewards + (low.float() * self.rew_cfg['battery_low_penalty'])
-        for b in range(B):
-            for i in range(N):
-                px = int(self.picker_xy[b, i, 0].item()); py = int(self.picker_xy[b, i, 1].item())
-                crowd = 0
-                for j in range(N):
-                    if j == i: continue
-                    ox = int(self.picker_xy[b, j, 0].item()); oy = int(self.picker_xy[b, j, 1].item())
-                    if abs(ox - px) + abs(oy - py) <= 1:
-                        crowd += 1
-                if crowd > 1:
-                    rewards[b, i] += -0.5
+        # Congestion via convolution
+        occ_flat = torch.zeros((B, H * W), dtype=torch.float32, device=self.device)
+        idx_flat = (self.picker_xy[:, :, 1].long() * W + self.picker_xy[:, :, 0].long()).clamp(0, H * W - 1)
+        occ_flat.scatter_add_(1, idx_flat, torch.ones_like(idx_flat, dtype=torch.float32))
+        occ = occ_flat.view(B, 1, H, W)
+        nb = F.conv2d(occ, torch.ones((1, 1, 3, 3), device=self.device), padding=1) - occ
+        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        neigh = nb.squeeze(1)[b_idx, self.picker_xy[:, :, 1].long(), self.picker_xy[:, :, 0].long()]
+        rewards = rewards + (neigh.ge(1.0).float() * -0.5)
         # 区域均衡（全局奖励）
         total = self.zone_loads.sum(dim=1)
         std = torch.std(self.zone_loads, dim=1)

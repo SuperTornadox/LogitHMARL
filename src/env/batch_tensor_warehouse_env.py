@@ -57,6 +57,10 @@ class BatchTensorWarehouseEnv:
         self.wt_heavy = float(wth.get('heavy', 70.0))
         self.wt_forklift_only = float(wth.get('forklift_only', 90.0))
         self.col_aisle = int(self.cfg.get('col_aisle', self.W // 2))
+        # Levels & forklift config
+        self.levels_per_shelf = int(self.cfg.get('levels_per_shelf', 3))
+        self.forklift_ratio = float(self.cfg.get('forklift_ratio', 0.2))
+        self.min_forklifts = int(self.cfg.get('min_forklifts', 0))
         # Speed config（用于张量化速度/效率；若未提供则使用默认）
         scfg = dict(self.cfg.get('speed_config', {
             'base_speed': {'regular': 1.0, 'forklift': 1.2},

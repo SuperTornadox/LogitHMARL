@@ -122,7 +122,7 @@ nl_cfg = dict(
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
     deterministic_eval=False,
-    n_envs=2048, # default to 256 when using tensor vecenv
+    n_envs=256, # default to 256 when using tensor vecenv
 )
 
 # DQN hyperparameters (device only for now)

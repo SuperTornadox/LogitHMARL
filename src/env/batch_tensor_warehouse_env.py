@@ -392,7 +392,7 @@ class BatchTensorWarehouseEnv:
                                  torch.full((B, N), self.base_speed_reg, device=self.device))
         # 任务权重 gather
         tid_mat = self.current_task_idx.clone()
-        tid_safe = torch.clamp(tid_mat, min=0)
+        tid_safe = torch.clamp(tid_mat, min=0, max=self.T - 1)
         task_w = self.task_weight  # (B,T)
         wt = torch.gather(task_w, 1, tid_safe)
         wt = torch.where(tid_mat >= 0, wt, torch.zeros_like(wt))
@@ -430,7 +430,6 @@ class BatchTensorWarehouseEnv:
         dx_act = dxv[actions]
         dy_act = dyv[actions]
         max_steps = int(steps_to_move.max().item()) if B * N > 0 else 0
-        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
         for s in range(max_steps):
             alive = (actions < 4) & (steps_to_move > s)
             if not bool(alive.any().detach().item()):
@@ -438,7 +437,9 @@ class BatchTensorWarehouseEnv:
             nx = cur_x + dx_act
             ny = cur_y + dy_act
             inb = (nx >= 0) & (ny >= 0) & (nx < W) & (ny < H)
-            obs = self.obstacle[b_idx, ny.clamp(0, H - 1), nx.clamp(0, W - 1)]
+            # Safe obstacle lookup via flattened gather
+            flat_idx_ms = (ny.clamp(0, H - 1) * W + nx.clamp(0, W - 1))
+            obs = self.obstacle.view(B, H * W).gather(1, flat_idx_ms.clamp(0, H * W - 1))
             ok = alive & inb & (~obs)
             # 朝目标更近奖励
             old_dist = (cur_x - tgt_x).abs() + (cur_y - tgt_y).abs()
@@ -598,12 +599,14 @@ class BatchTensorWarehouseEnv:
                         self.task_assigned[b, tid] = int(pid)
                         self.current_task_idx[b, pid] = int(tid)
 
-        # Actions tensor [B,N]
+        # Actions tensor [B,N] (map invalid to IDLE)
         actions = torch.full((B, N), 4, dtype=torch.long, device=self.device)
         for b in range(B):
             if b < len(actions_per_env):
                 arr = torch.tensor(actions_per_env[b], dtype=torch.long, device=self.device)
                 actions[b, :min(N, arr.numel())] = arr[:N]
+        # Clamp to valid action space 0..4
+        actions = actions.clamp(min=0, max=4)
 
         # Movement for provided actions (single-step)
         rewards = torch.zeros((B, N), dtype=torch.float32, device=self.device)

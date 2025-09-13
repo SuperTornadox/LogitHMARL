@@ -353,7 +353,7 @@ class BatchTensorWarehouseEnv:
 
         # Vectorized greedy step per picker: choose action reducing L1 distance
         tid_mat = self.current_task_idx.clone()
-        tid_safe = torch.clamp(tid_mat, min=0)
+        tid_safe = torch.clamp(tid_mat, min=0, max=self.T - 1)
         shelf_x = torch.gather(self.task_shelf[:, :, 0], 1, tid_safe)
         shelf_y = torch.gather(self.task_shelf[:, :, 1], 1, tid_safe)
         station_x = torch.gather(self.task_station[:, :, 0], 1, tid_safe)
@@ -612,7 +612,7 @@ class BatchTensorWarehouseEnv:
         nx = cur_x + dx_act
         ny = cur_y + dy_act
         inb = (nx >= 0) & (ny >= 0) & (nx < W) & (ny < H)
-        b_idx = torch.arange(B, device=self.device).view(B, 1)
+        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
         obs = self.obstacle[b_idx, ny.clamp(0, H - 1), nx.clamp(0, W - 1)]
         ok = (actions < 4) & inb & (~obs)
         self.picker_xy[:, :, 0] = torch.where(ok, nx.clamp(0, W - 1), cur_x)
@@ -623,7 +623,7 @@ class BatchTensorWarehouseEnv:
         idle_mask = (actions == 4)
         tid_mat = self.current_task_idx
         has_task = tid_mat.ge(0)
-        tid_safe = torch.clamp(tid_mat, min=0)
+        tid_safe = torch.clamp(tid_mat, min=0, max=self.T - 1)
         px = self.picker_xy[:, :, 0].long(); py = self.picker_xy[:, :, 1].long()
         shx = torch.gather(self.task_shelf[:, :, 0], 1, tid_safe)
         shy = torch.gather(self.task_shelf[:, :, 1], 1, tid_safe)

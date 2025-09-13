@@ -446,27 +446,56 @@ def evaluate_method(method_name: str,
             # 学习法：直接用模型选；规则法：简单导航
             if is_learning and model is not None:
                 # 简单策略：未携货→靠近“货架相邻可达格”；相邻则IDLE；携货→靠近站点，相邻则IDLE
-                for i, p in enumerate(env.pickers):
-                    if getattr(p, 'current_task', None) is None:
-                        actions[i] = 4
-                        continue
-                    t = p.current_task
-                    if len(p.carrying_items) == 0:
-                        sh = env.shelves[t.shelf_id]
-                        # 目标设为“货架相邻的可达格”，避免在距离=1的环上摆动
-                        adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
-                        if adj is None:
-                            actions[i] = 4
-                        elif (p.x, p.y) == adj or (abs(p.x - sh['x']) + abs(p.y - sh['y']) == 1):
+                # Try GPU batch nav first
+                try:
+                    import torch
+                    from exp.gpu_nav import gpu_smart_navigate_batch
+                    grid_t = torch.as_tensor(env.grid, dtype=torch.int32)
+                    N = len(env.pickers)
+                    picker_xy = torch.tensor([[p.x, p.y] for p in env.pickers], dtype=torch.long)
+                    target_xy = torch.full((N, 2), -1, dtype=torch.long)
+                    for i, p in enumerate(env.pickers):
+                        if getattr(p, 'current_task', None) is None:
+                            continue
+                        t = p.current_task
+                        if len(p.carrying_items) == 0 and t.shelf_id is not None and t.shelf_id < len(env.shelves):
+                            sh = env.shelves[t.shelf_id]
+                            adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                            tx, ty = (adj if adj is not None else (sh['x'], sh['y']))
+                        elif len(p.carrying_items) > 0 and t.station_id is not None and t.station_id < len(env.stations):
+                            st = env.stations[t.station_id]
+                            tx, ty = (st['x'], st['y'])
+                        else:
+                            continue
+                        target_xy[i] = torch.tensor([tx, ty], dtype=torch.long)
+                    nav = gpu_smart_navigate_batch(grid_t, picker_xy, target_xy)
+                    actions = {}
+                    manhattan = (picker_xy - target_xy.clamp(min=0)).abs().sum(dim=1)
+                    for i in range(N):
+                        if target_xy[i, 0] >= 0 and manhattan[i].item() == 1:
                             actions[i] = 4
                         else:
-                            actions[i] = smart_navigate(p, adj, env)
-                    else:
-                        st = env.stations[t.station_id]
-                        if abs(p.x - st['x']) + abs(p.y - st['y']) == 1:
+                            actions[i] = int(nav[i].item())
+                except Exception:
+                    actions = {}
+                    for i, p in enumerate(env.pickers):
+                        if getattr(p, 'current_task', None) is None:
                             actions[i] = 4
+                            continue
+                        t = p.current_task
+                        if len(p.carrying_items) == 0:
+                            sh = env.shelves[t.shelf_id]
+                            adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                            if adj is None or (p.x, p.y) == adj or (abs(p.x - sh['x']) + abs(p.y - sh['y']) == 1):
+                                actions[i] = 4
+                            else:
+                                actions[i] = smart_navigate(p, adj, env)
                         else:
-                            actions[i] = smart_navigate(p, (st['x'], st['y']), env)
+                            st = env.stations[t.station_id]
+                            if abs(p.x - st['x']) + abs(p.y - st['y']) == 1:
+                                actions[i] = 4
+                            else:
+                                actions[i] = smart_navigate(p, (st['x'], st['y']), env)
             elif method_name in ('NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC') and model is not None:
                 # Use worker policy to act; sanitize invalid moves
                 from exp.obs import get_agent_observation

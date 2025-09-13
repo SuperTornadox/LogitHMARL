@@ -25,6 +25,10 @@ def _worker(remote: Connection, env_config: Dict[str, Any], max_tasks: int) -> N
             get_valid_actions,
         )
         from exp.assigners import assign_tasks_dynamic
+        try:
+            from exp.gpu_nav import gpu_smart_navigate_batch  # optional GPU nav
+        except Exception:
+            gpu_smart_navigate_batch = None
     except Exception as e:
         remote.send({'error': f'import_failed: {e}'})
         remote.close(); return
@@ -142,7 +146,47 @@ def _worker(remote: Connection, env_config: Dict[str, Any], max_tasks: int) -> N
                                     a = 4
                         actions[i] = a
                 else:
+                    # Try GPU batch navigation first
+                    if gpu_smart_navigate_batch is not None:
+                        try:
+                            import torch
+                            grid_t = torch.as_tensor(env.grid, dtype=torch.int32)
+                            N = len(env.pickers)
+                            picker_xy = torch.tensor([[p.x, p.y] for p in env.pickers], dtype=torch.long)
+                            target_xy = torch.full((N, 2), -1, dtype=torch.long)
+                            for i, p in enumerate(env.pickers):
+                                t = getattr(p, 'current_task', None)
+                                if t is None:
+                                    continue
+                                if len(p.carrying_items) == 0:
+                                    if t.shelf_id is None or t.shelf_id >= len(env.shelves):
+                                        continue
+                                    sh = env.shelves[t.shelf_id]
+                                    adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                                    tx, ty = (adj if adj is not None else (sh['x'], sh['y']))
+                                else:
+                                    if t.station_id is None or t.station_id >= len(env.stations):
+                                        continue
+                                    st = env.stations[t.station_id]
+                                    tx, ty = (st['x'], st['y'])
+                                target_xy[i] = torch.tensor([tx, ty], dtype=torch.long)
+                            nav = gpu_smart_navigate_batch(grid_t, picker_xy, target_xy)
+                            actions = {}
+                            # Force IDLE on adjacency to trigger pick/drop
+                            manhattan = (picker_xy - target_xy.clamp(min=0)).abs().sum(dim=1)
+                            for i in range(len(env.pickers)):
+                                if target_xy[i, 0] >= 0 and manhattan[i].item() == 1:
+                                    actions[i] = 4
+                                else:
+                                    actions[i] = int(nav[i].item())
+                        except Exception:
+                            actions = {}
+                    else:
+                        actions = {}
+                    # Fallback to CPU heuristic for any unset entries
                     for i, p in enumerate(env.pickers):
+                        if i in actions:
+                            continue
                         t = getattr(p, 'current_task', None)
                         if t is None:
                             actions[i] = 4

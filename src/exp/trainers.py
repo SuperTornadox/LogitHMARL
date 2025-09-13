@@ -9,6 +9,48 @@ from exp.actions import get_valid_actions, convert_to_dynamic_actions
 from exp.assigners import assign_tasks_dynamic
 from exp.obs import get_global_state, get_task_features
 from exp.vecenv import SubprocVecEnv
+from exp.actions import find_adjacent_accessible_position, smart_navigate
+
+
+def _try_gpu_nav_actions(env):
+    """Attempt to compute heuristic navigation actions on GPU in batch.
+    Returns a dict {i: action} or None on failure.
+    """
+    try:
+        import torch
+        from exp.gpu_nav import gpu_smart_navigate_batch
+        # Grid to tensor
+        grid = torch.as_tensor(env.grid, dtype=torch.int32)
+        # Picker and target tensors
+        N = len(env.pickers)
+        picker_xy = torch.tensor([[p.x, p.y] for p in env.pickers], dtype=torch.long)
+        target_xy = torch.full((N, 2), -1, dtype=torch.long)
+        for i, p in enumerate(env.pickers):
+            t = getattr(p, 'current_task', None)
+            if t is None:
+                continue
+            if len(p.carrying_items) == 0:
+                if t.shelf_id is None or t.shelf_id >= len(env.shelves):
+                    continue
+                sh = env.shelves[t.shelf_id]
+                adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                tx, ty = (adj if adj is not None else (sh['x'], sh['y']))
+            else:
+                if t.station_id is None or t.station_id >= len(env.stations):
+                    continue
+                st = env.stations[t.station_id]
+                tx, ty = (st['x'], st['y'])
+            target_xy[i] = torch.tensor([tx, ty], dtype=torch.long)
+        actions_t = gpu_smart_navigate_batch(grid, picker_xy, target_xy)
+        # Force IDLE when adjacent to allow pick/drop
+        tx = target_xy[:, 0].clamp(min=0)
+        ty = target_xy[:, 1].clamp(min=0)
+        manhattan = (picker_xy - torch.stack([tx, ty], dim=1)).abs().sum(dim=1)
+        adj_mask = (target_xy[:, 0] >= 0) & (manhattan == 1)
+        actions_t = torch.where(adj_mask, torch.full_like(actions_t, 4), actions_t)
+        return {i: int(actions_t[i].item()) for i in range(N)}
+    except Exception:
+        return None
 
 
 def _enable_torch_perf():
@@ -597,27 +639,29 @@ def train_nl_hmarl(
                 local_mask[idx] = False
                 decisions.append((s, tf, nid, m, torch.tensor(idx, dtype=torch.long, device=model.device)))
             # Heuristic actions and step
-            actions = {}
-            for i, p in enumerate(env.pickers):
-                t = getattr(p, 'current_task', None)
-                if t is None:
-                    actions[i] = 4; continue
-                if len(p.carrying_items) == 0:
-                    if t.shelf_id is None or t.shelf_id >= len(env.shelves):
-                        actions[i] = 4
-                    else:
-                        sh = env.shelves[t.shelf_id]
-                        adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
-                        if adj is None or (p.x, p.y) == adj or (abs(p.x - sh['x']) + abs(p.y - sh['y']) == 1):
+            actions = _try_gpu_nav_actions(env)
+            if actions is None:
+                actions = {}
+                for i, p in enumerate(env.pickers):
+                    t = getattr(p, 'current_task', None)
+                    if t is None:
+                        actions[i] = 4; continue
+                    if len(p.carrying_items) == 0:
+                        if t.shelf_id is None or t.shelf_id >= len(env.shelves):
                             actions[i] = 4
                         else:
-                            actions[i] = smart_navigate(p, adj, env)
-                else:
-                    if t.station_id is None or t.station_id >= len(env.stations):
-                        actions[i] = 4
+                            sh = env.shelves[t.shelf_id]
+                            adj = find_adjacent_accessible_position(env, (sh['x'], sh['y']), (p.x, p.y))
+                            if adj is None or (p.x, p.y) == adj or (abs(p.x - sh['x']) + abs(p.y - sh['y']) == 1):
+                                actions[i] = 4
+                            else:
+                                actions[i] = smart_navigate(p, adj, env)
                     else:
-                        st = env.stations[t.station_id]
-                        actions[i] = 4 if abs(p.x - st['x']) + abs(p.y - st['y']) == 1 else smart_navigate(p, (st['x'], st['y']), env)
+                        if t.station_id is None or t.station_id >= len(env.stations):
+                            actions[i] = 4
+                        else:
+                            st = env.stations[t.station_id]
+                            actions[i] = 4 if abs(p.x - st['x']) + abs(p.y - st['y']) == 1 else smart_navigate(p, (st['x'], st['y']), env)
             env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
             _, rewards, _, _ = env.step(env_actions)
             step_reward = float(sum(rewards.values())) if isinstance(rewards, dict) else float(rewards)
@@ -996,13 +1040,17 @@ def train_nl_hmarl_ac(
             with torch.no_grad():
                 actions_idx = torch.multinomial(torch.clamp(out['action_probs'], min=1e-8), num_samples=1).squeeze(1)
             actions = {}
+            # Try GPU nav to fix invalids in batch
+            gpu_actions = _try_gpu_nav_actions(env)
             for i, p in enumerate(env.pickers):
                 a = int(actions_idx[i].item())
                 if a in (0, 1, 2, 3):
                     dd = {0: (0, -1), 1: (0, 1), 2: (-1, 0), 3: (1, 0)}[a]
                     nx, ny = p.x + dd[0], p.y + dd[1]
                     invalid = not (0 <= nx < env.width and 0 <= ny < env.height) or (env.grid[ny, nx] == 2)
-                    if invalid:
+                    if invalid and gpu_actions is not None:
+                        a = gpu_actions.get(i, 4)
+                    elif invalid:
                         t = getattr(p, 'current_task', None)
                         target = None
                         if t is not None:

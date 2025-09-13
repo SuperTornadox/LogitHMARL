@@ -81,7 +81,7 @@ train_cfg = dict(
     buffer_size=200000,
     update_freq=1,
     # 保持每个环境的目标网络更新节奏：约 50 步/环境
-    target_update_freq=50 * _RECOMM_N_ENVS,
+    target_update_freq=50 * 2048,
     hidden_dim=512,
 )
 

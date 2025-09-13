@@ -597,6 +597,7 @@ def train_nl_hmarl(
     # Logging buffers
     steps_log, loss_log, reward_log = [], [], []
     env_steps_log = []
+    env_steps_log = []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL', ncols=100)
     for step in pbar:

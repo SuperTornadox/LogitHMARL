@@ -1470,6 +1470,7 @@ def train_nl_hmarl_tensorvec(
     optim = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr)
 
     steps_log, loss_log, reward_log = [], [], []
+    env_steps_log = []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     # Warmup one step to spawn tasks so manager has candidates from step 1
     try:

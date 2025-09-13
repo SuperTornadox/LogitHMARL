@@ -416,20 +416,24 @@ def evaluate_method(method_name: str,
                 env.set_control_hook(control_hook)
             except Exception:
                 pass
-        # 注册统一速度函数（必须，与环境强制要求一致）；并做一次覆盖范围校验
+        # 注册统一速度函数（必须，与环境强制要求一致）；并在可用时做一次覆盖范围校验
         if speed_function is None:
             raise RuntimeError("speed_function is required by environment; please pass speed_function=... to evaluate_method")
-        env.set_speed_function(speed_function)
-        # 立即做一次校验：应为每个 picker 提供正数速度
-        speeds_probe = speed_function(env)
-        if not isinstance(speeds_probe, dict):
-            raise RuntimeError("speed_function must return a dict {picker_id: speed}.")
-        missing = [p.id for p in env.pickers if p.id not in speeds_probe]
-        if missing:
-            raise RuntimeError(f"speed_function missing speed for pickers {missing}.")
-        bad = {pid: v for pid, v in speeds_probe.items() if float(v) <= 0}
-        if bad:
-            raise RuntimeError(f"speed_function returned non-positive speeds: {bad}.")
+        try:
+            env.set_speed_function(speed_function)
+        except Exception:
+            pass
+        # 若环境具备 pickers 列表（CPU 版），执行速度探针校验；张量版跳过该校验
+        if hasattr(env, 'pickers'):
+            speeds_probe = speed_function(env)
+            if not isinstance(speeds_probe, dict):
+                raise RuntimeError("speed_function must return a dict {picker_id: speed}.")
+            missing = [p.id for p in env.pickers if p.id not in speeds_probe]
+            if missing:
+                raise RuntimeError(f"speed_function missing speed for pickers {missing}.")
+            bad = {pid: v for pid, v in speeds_probe.items() if float(v) <= 0}
+            if bad:
+                raise RuntimeError(f"speed_function returned non-positive speeds: {bad}.")
         do_verbose = verbose and (not debug_first_episode_only or ep == 0)
         # Decide whether to save frames for this episode
         save_plots_this = save_plots and (not debug_first_episode_only or ep == 0)

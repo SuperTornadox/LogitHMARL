@@ -370,8 +370,11 @@ class BatchTensorWarehouseEnv:
         cand_nx = px.unsqueeze(-1) + cand_dx
         cand_ny = py.unsqueeze(-1) + cand_dy
         inb = (cand_nx >= 0) & (cand_ny >= 0) & (cand_nx < W) & (cand_ny < H)
-        b_idx = torch.arange(B, device=self.device).view(B, 1, 1).expand(B, N, 4)
-        obs_here = self.obstacle[b_idx, cand_ny.clamp(0, H - 1), cand_nx.clamp(0, W - 1)]
+        # Safe obstacle lookup via gather on flattened grid
+        flat_idx = (cand_ny.clamp(0, H - 1) * W + cand_nx.clamp(0, W - 1)).view(B, N * 4)
+        obs_flat = self.obstacle.view(B, H * W)
+        obs_g = obs_flat.gather(1, flat_idx.clamp(0, H * W - 1)).view(B, N, 4)
+        obs_here = obs_g
         ok = inb & (~obs_here)
         # Distances after move
         tx = tgt_x.unsqueeze(-1); ty = tgt_y.unsqueeze(-1)
@@ -612,8 +615,9 @@ class BatchTensorWarehouseEnv:
         nx = cur_x + dx_act
         ny = cur_y + dy_act
         inb = (nx >= 0) & (ny >= 0) & (nx < W) & (ny < H)
-        b_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
-        obs = self.obstacle[b_idx, ny.clamp(0, H - 1), nx.clamp(0, W - 1)]
+        # Safe obstacle lookup via gather on flattened grid
+        flat_idx2 = (ny.clamp(0, H - 1) * W + nx.clamp(0, W - 1))
+        obs = self.obstacle.view(B, H * W).gather(1, flat_idx2.clamp(0, H * W - 1))
         ok = (actions < 4) & inb & (~obs)
         self.picker_xy[:, :, 0] = torch.where(ok, nx.clamp(0, W - 1), cur_x)
         self.picker_xy[:, :, 1] = torch.where(ok, ny.clamp(0, H - 1), cur_y)

@@ -101,6 +101,9 @@ debug_cfg = dict(
     clean_before_run=True,        # 运行前清理上次的帧目录与训练指标
 )
 
+# 是否使用张量化（GPU）环境原型（接口一致，行为在逐步对齐中）
+USE_TENSOR_ENV = True  # True 时使用 TensorWarehouseEnv（可自动回退 CPU）
+
 
 # NL-HMARL hyperparameters (exposed to evaluate)
 nl_cfg = dict(
@@ -161,7 +164,23 @@ def main():
         sys.path.insert(0, src_dir)
 
     from exp.evaluate import evaluate_method
-    from env.dynamic_warehouse_env import DynamicWarehouseEnv
+    # 依据开关选择环境构造器
+    if USE_TENSOR_ENV:
+        from env.tensor_warehouse_env import TensorWarehouseEnv  # type: ignore
+        def _env_ctor(cfg):
+            cfg = dict(cfg)
+            try:
+                import torch
+                dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+            except Exception:
+                dev = 'cpu'
+            cfg['device'] = dev
+            print(f"[info] Using TensorWarehouseEnv ({dev})")
+            return TensorWarehouseEnv(cfg)
+    else:
+        from env.dynamic_warehouse_env import DynamicWarehouseEnv
+        def _env_ctor(cfg):
+            return DynamicWarehouseEnv(cfg)
 
     methods = [
         'NL-HMARL-AC',    # NL 管理层 + 工人层 A-C 学习
@@ -262,8 +281,8 @@ def main():
             debug_first_episode_only=debug_cfg['debug_first_episode_only'],
             make_animation=debug_cfg['make_animation'],
             animation_fps=debug_cfg['animation_fps'],
-            # 直接使用 DynamicWarehouseEnv 创建环境
-            env_ctor=lambda cfg: DynamicWarehouseEnv(cfg),
+            # 直接使用环境构造器（CPU 动态/或 GPU 张量化）
+            env_ctor=_env_ctor,
             # 传递额外的环境配置，确保叉车生成
             env_extra={
                 'min_forklifts': env_cfg.get('min_forklifts', 0),

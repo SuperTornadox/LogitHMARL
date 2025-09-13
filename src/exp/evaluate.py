@@ -435,6 +435,13 @@ def evaluate_method(method_name: str,
                 _ = vec.step_with_decisions_and_actions_tensor([[] for _ in range(B)], [[4] * N for _ in range(B)])
             except Exception:
                 pass
+            # Prepare plotting for first env of first episode
+            save_plots_this = save_plots and (ep == 0 if debug_first_episode_only else True)
+            if save_plots_this:
+                base_plot_dir = plot_dir or os.path.join('results', 'frames')
+                os.makedirs(base_plot_dir, exist_ok=True)
+                ep_dir = os.path.join(base_plot_dir, f"{method_name}_ep{ep:02d}")
+                os.makedirs(ep_dir, exist_ok=True)
             # Rollout
             for step_i in range(max_time_limit):
                 feats = vec.get_features()
@@ -488,12 +495,49 @@ def evaluate_method(method_name: str,
                         ep_bar.set_postfix(ep=ep+1, step=step_i, rew=f"{mean_rew:.2f}")
                     except Exception:
                         pass
+                # Save frame for the first env (b=0)
+                if save_plots_this and (step_i % max(1, plot_every)) == 0:
+                    try:
+                        import matplotlib.pyplot as _plt
+                        import numpy as _np
+                        e = vec.env; b = 0
+                        H, W = e.H, e.W
+                        grid = e.grid[b].detach().to('cpu').numpy()
+                        px = e.picker_xy[b, :, 0].detach().to('cpu').numpy()
+                        py = e.picker_xy[b, :, 1].detach().to('cpu').numpy()
+                        fig = _plt.figure(figsize=plot_figsize or (6, 6))
+                        ax = _plt.gca()
+                        img = _np.zeros((H, W, 3), dtype=_np.float32)
+                        img[:, :] = [1.0, 1.0, 1.0]
+                        img[grid == 2] = [0.7, 0.7, 0.7]
+                        img[grid == 3] = [0.3, 0.9, 0.3]
+                        ax.imshow(img, origin='lower', interpolation='nearest')
+                        ax.scatter(px, py, c='red', s=20, edgecolors='black', linewidths=0.5)
+                        ax.set_xticks([]); ax.set_yticks([])
+                        ax.set_xlim([-0.5, W - 0.5]); ax.set_ylim([-0.5, H - 0.5])
+                        _plt.tight_layout()
+                        _plt.savefig(os.path.join(ep_dir, f"t{step_i:04d}.png"), dpi=120)
+                        _plt.close(fig)
+                    except Exception as _e:
+                        try:
+                            print(f"[warn] tensor-eval frame save failed at step {step_i}: {_e}")
+                        except Exception:
+                            pass
             # simple postfix per episode
             # finalize episode postfix
             try:
                 ep_bar.set_postfix(ep=ep+1, step=max_time_limit)
             except Exception:
                 pass
+            # Compile GIF/MP4 for the first episode
+            if save_plots_this and make_animation:
+                try:
+                    _compile_frames_to_media(ep_dir, fps=animation_fps)
+                except Exception as _e:
+                    try:
+                        print(f"[warn] Failed to compile animation for {method_name} ep{ep}: {_e}")
+                    except Exception:
+                        pass
             # Collect episode metrics
             env_i = vec.env
             orders_completed = int(env_i.total_orders_completed.sum().item()) if hasattr(env_i, 'total_orders_completed') else 0

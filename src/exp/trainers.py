@@ -1557,6 +1557,9 @@ def train_nl_hmarl_tensorvec(
             cur_ent = float(loss_dict['entropy'].item())
 
         if log_metrics and (step % max(1, log_every) == 0):
+            # Fallback guard in case runtime loaded older symbol set
+            if 'env_steps_log' not in locals():
+                env_steps_log = []
             steps_log.append(step)
             loss_log.append(cur_loss)
             step_rew = float(stp['step_reward'].mean().item()) if isinstance(stp, dict) else 0.0

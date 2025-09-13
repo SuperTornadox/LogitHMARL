@@ -71,9 +71,7 @@ env_cfg = dict(
 )
 
 
-# 根据机器核数给出推荐并行环境数（上限 32，下限 2）
-_CPU_COUNT = os.cpu_count() or 4
-_RECOMM_N_ENVS = max(2, min(_CPU_COUNT, 32))
+
 
 # 训练参数（Flat-DQN）
 train_cfg = dict(
@@ -124,13 +122,13 @@ nl_cfg = dict(
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
     deterministic_eval=False,
-    n_envs=(2 if True else _RECOMM_N_ENVS), # default to 256 when using tensor vecenv
+    n_envs=2048, # default to 256 when using tensor vecenv
 )
 
 # DQN hyperparameters (device only for now)
 dqn_cfg = dict(
     device='cuda',  # 'auto' | 'cpu' | 'cuda' | 'cuda:0' | 'mps'
-    n_envs=_RECOMM_N_ENVS,
+    n_envs=2048,
 )
 
 

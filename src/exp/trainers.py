@@ -328,12 +328,12 @@ def train_flat_dqn_subproc(
             'simulation_hours': 2,
         },
     }
-    vec = SubprocVecEnv(int(max(2, n_envs)), env_config, max_tasks=20)
+    vec = SubprocVecEnv(int(max(1, n_envs)), env_config, max_tasks=20)
 
     obs_dim = 40 if pure_learning else 45
     action_dim = 7
     # Keep per-env target update cadence similar under parallelism
-    eff_target_update = max(1, int(target_update_freq // max(1, int(max(2, n_envs)))))
+    eff_target_update = max(1, int(target_update_freq // max(1, int(max(1, n_envs)))))
     model = FlatMARLDQN(
         state_dim=obs_dim,
         action_dim=action_dim,
@@ -360,7 +360,7 @@ def train_flat_dqn_subproc(
     q_logs = []
 
     include_global = not pure_learning
-    used_envs = int(max(2, n_envs))
+    used_envs = int(max(1, n_envs))
     total_agents = used_envs * n_pickers
     import time as _time
     _t0 = _time.time()
@@ -769,7 +769,7 @@ def train_nl_hmarl_subproc(
     from tqdm import tqdm
     from baselines.nl_hmarl import NLHMARL
 
-    used_envs = int(max(2, n_envs))
+    used_envs = int(max(1, n_envs))
     vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
     f0 = vec.get_features_tensor(device=device)
     state_dim = int(f0['state'].shape[1])
@@ -1219,7 +1219,7 @@ def train_nl_hmarl_ac_subproc(
     from tqdm import tqdm
     from baselines.nl_hmarl import NLHMARL
 
-    used_envs = int(max(2, n_envs))
+    used_envs = int(max(1, n_envs))
     vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
     f0 = vec.get_features()[0]
     # Dimensions
@@ -1467,6 +1467,12 @@ def train_nl_hmarl_tensorvec(
 
     steps_log, loss_log, reward_log = [], [], []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
+    # Warmup one step to spawn tasks so manager has candidates from step 1
+    try:
+        B_warm = int(max(1, n_envs)); N_warm = int(env_config.get('n_pickers', 1))
+        _ = vec.step_with_decisions_and_actions_tensor([[] for _ in range(B_warm)], [[4] * N_warm for _ in range(B_warm)])
+    except Exception:
+        pass
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL (tensorvec)', ncols=100)
     for step in pbar:
         feats = vec.get_features()
@@ -1550,8 +1556,10 @@ def train_nl_hmarl_tensorvec(
             step_rew = float(stp['step_reward'].mean().item()) if isinstance(stp, dict) else 0.0
             reward_log.append(step_rew)
             pol_log.append(cur_pl); val_log.append(cur_vl); entL_log.append(cur_el); ent_log.append(cur_ent)
+        # Do not coerce NaN to 0 in display; show 'nan' if not finite
+        disp_loss = cur_loss if np.isfinite(cur_loss) else float('nan')
         try:
-            pbar.set_postfix(rew=f"{step_rew:.2f}", loss=f"{(0 if not np.isfinite(cur_loss) else cur_loss):.3f}")
+            pbar.set_postfix(rew=f"{step_rew:.2f}", loss=f"{disp_loss:.3f}")
         except Exception:
             pass
 
@@ -1620,7 +1628,7 @@ def train_nl_hmarl_ac_subproc(
     from tqdm import tqdm
     from baselines.nl_hmarl import NLHMARL
 
-    used_envs = int(max(2, n_envs))
+    used_envs = int(max(1, n_envs))
     vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
     f0 = vec.get_features_tensor(device=device)
     state_dim = int(f0['state'].shape[1])
@@ -1764,8 +1772,9 @@ def train_nl_hmarl_ac_subproc(
             m_vl_log.append(cur_m_vl)
             m_entL_log.append(cur_m_el)
             m_ent_log.append(cur_m_ent)
+        disp_m = cur_m_loss if np.isfinite(cur_m_loss) else float('nan')
         try:
-            pbar.set_postfix(rew=f"{float(stp['step_reward'].mean().item()):.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
+            pbar.set_postfix(rew=f"{float(stp['step_reward'].mean().item()):.2f}", mL=f"{disp_m:.3f}", wL=f"{cur_w_loss:.3f}")
         except Exception:
             pass
 
@@ -1857,6 +1866,12 @@ def train_nl_hmarl_ac_tensorvec(
 
     steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
     m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
+    # Warmup: spawn tasks before first decision
+    try:
+        B_warm = int(max(1, n_envs)); N_warm = int(env_config.get('n_pickers', 1))
+        _ = vec.step_with_decisions_and_actions_tensor([[] for _ in range(B_warm)], [[4] * N_warm for _ in range(B_warm)])
+    except Exception:
+        pass
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (tensorvec)', ncols=100)
     for step in pbar:
         feats_list = vec.get_features()
@@ -1993,8 +2008,9 @@ def train_nl_hmarl_ac_tensorvec(
             m_vl_log.append(cur_m_vl)
             m_entL_log.append(cur_m_el)
             m_ent_log.append(cur_m_ent)
+        disp_m = cur_m_loss if np.isfinite(cur_m_loss) else float('nan')
         try:
-            pbar.set_postfix(rew=f"{mean_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}")
+            pbar.set_postfix(rew=f"{mean_rew:.2f}", mL=f"{disp_m:.3f}")
         except Exception:
             pass
 

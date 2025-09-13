@@ -73,6 +73,18 @@ def evaluate_method(method_name: str,
                 extra = {k: v for k, v in extra.items() if k != 'order_config'}
             cfg.update(extra)
         env = env_ctor(cfg)
+        # If the provided ctor yields a tensorized env (no `pickers` list),
+        # fall back to the classic CPU env for evaluation compatibility.
+        # Evaluation code below expects `env.pickers`, `task_pool`, etc.
+        if not hasattr(env, 'pickers') and method_name in (
+            'NL-HMARL', 'NLHMARL', 'NL_HMARL',
+            'NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC'
+        ):
+            try:
+                print('[info] Eval fallback: switching to CPU DynamicWarehouseEnv for compatibility')
+            except Exception:
+                pass
+            env = create_test_env(width, height, n_pickers, n_shelves, n_stations, order_rate, max_items)
     else:
         env = create_test_env(width, height, n_pickers, n_shelves, n_stations, order_rate, max_items)
     

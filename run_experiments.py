@@ -71,15 +71,20 @@ env_cfg = dict(
 )
 
 
+# 根据机器核数给出推荐并行环境数（上限 32，下限 2）
+_CPU_COUNT = os.cpu_count() or 4
+_RECOMM_N_ENVS = max(2, min(_CPU_COUNT, 32))
+
 # 训练参数（Flat-DQN）
 train_cfg = dict(
     training_steps=100000,
-    batch_size=256,
+    batch_size=2048,
     learning_rate=1e-3,
-    buffer_size=10000,
-    update_freq=4,
-    target_update_freq=50,
-    hidden_dim=256,
+    buffer_size=200000,
+    update_freq=1,
+    # 保持每个环境的目标网络更新节奏：约 50 步/环境
+    target_update_freq=50 * _RECOMM_N_ENVS,
+    hidden_dim=512,
 )
 
 # 调试/可视化选项（一次配置，适用于所有方法）
@@ -100,11 +105,11 @@ debug_cfg = dict(
 # NL-HMARL hyperparameters (exposed to evaluate)
 nl_cfg = dict(
     # Model
-    hidden_dim=train_cfg.get('hidden_dim', 256),
+    hidden_dim=train_cfg.get('hidden_dim', 512),
     n_nests=2,              # number of nests: 0=非叉车，1=叉车
     learn_eta=False,        # whether to learn eta per nest
     eta_init=1.0,           # initial eta value per nest
-    device='auto',  # 'auto' | 'cpu' | 'cuda' | 'cuda:0' | 'mps'
+    device='cuda',  # 'auto' | 'cpu' | 'cuda' | 'cuda:0' | 'mps'
     # Training
     manager_lr=train_cfg.get('learning_rate', 1e-3),
     worker_lr=train_cfg.get('learning_rate', 1e-3),
@@ -116,12 +121,13 @@ nl_cfg = dict(
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
     deterministic_eval=False,
-    n_envs=32, # number of environments to train on
+    n_envs=_RECOMM_N_ENVS, # number of environments to train on
 )
 
 # DQN hyperparameters (device only for now)
 dqn_cfg = dict(
-    device='auto',  # 'auto' | 'cpu' | 'cuda' | 'cuda:0' | 'mps'
+    device='cuda',  # 'auto' | 'cpu' | 'cuda' | 'cuda:0' | 'mps'
+    n_envs=_RECOMM_N_ENVS,
 )
 
 

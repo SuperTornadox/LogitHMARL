@@ -11,6 +11,18 @@ from exp.obs import get_global_state, get_task_features
 from exp.vecenv import SubprocVecEnv
 
 
+def _enable_torch_perf():
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore[attr-defined]
+        torch.backends.cudnn.allow_tf32 = True  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        torch.set_float32_matmul_precision('high')  # PyTorch >= 1.12
+    except Exception:
+        pass
+
+
 def train_flat_dqn(
     width: int, height: int,
     n_pickers: int, n_shelves: int, n_stations: int,
@@ -39,6 +51,7 @@ def train_flat_dqn(
     - 动作：7（0..6，5/6 在下发时归一到 4）
     - 回放与目标网络更新等细节由 FlatMARLDQN 内部处理
     """
+    _enable_torch_perf()
     from exp.env_factory import create_test_env
     env = create_test_env(width, height, n_pickers, n_shelves, n_stations, order_rate, max_items)
 
@@ -254,6 +267,7 @@ def train_flat_dqn_subproc(
     - Each env contains n_pickers agents; observations are concatenated across envs for a single forward.
     - Actions are picked per-agent with epsilon-greedy and sent back to each env.
     """
+    _enable_torch_perf()
     # Build env_config consistent with env_factory.create_test_env
     env_config = {
         'width': width,
@@ -276,13 +290,15 @@ def train_flat_dqn_subproc(
 
     obs_dim = 40 if pure_learning else 45
     action_dim = 7
+    # Keep per-env target update cadence similar under parallelism
+    eff_target_update = max(1, int(target_update_freq // max(1, int(max(2, n_envs)))))
     model = FlatMARLDQN(
         state_dim=obs_dim,
         action_dim=action_dim,
         n_agents=n_pickers,
         hidden_dim=hidden_dim,
         lr=lr,
-        target_update_freq=target_update_freq,
+        target_update_freq=eff_target_update,
         batch_size=batch_size,
         buffer_size=buffer_size,
         use_double_dqn=True,
@@ -306,6 +322,7 @@ def train_flat_dqn_subproc(
     total_agents = used_envs * n_pickers
     import time as _time
     _t0 = _time.time()
+    eff_update_freq = max(1, int(update_freq // used_envs))
     for step in pbar:
         # Collect observations and masks from all envs
         outs = vec.get_dqn_obs(include_global=include_global)
@@ -318,24 +335,23 @@ def train_flat_dqn_subproc(
         masks_all = np.vstack(mask_batches)
         obs_tensor = torch.tensor(obs_all, dtype=torch.float32, device=model.device)
         with torch.no_grad():
-            q_vals = model.q_network(obs_tensor).detach().cpu().numpy()  # (E*N,7)
-        q_vals[masks_all == 0] = -np.inf
+            q_t = model.q_network(obs_tensor)  # (E*N,7)
+        mask_t = torch.tensor(masks_all, dtype=torch.bool, device=model.device)
+        q_t = q_t.masked_fill(~mask_t, float('-inf'))
+        greedy = torch.argmax(q_t, dim=1).detach().cpu().numpy()
         # Epsilon per-current step across all agents
         eps_start = getattr(model, 'epsilon_start', 1.0)
         eps_end = getattr(model, 'epsilon_end', 0.05)
         eps_decay = max(1, int(getattr(model, 'epsilon_decay', 100000)))
         cur_eps = eps_end + (eps_start - eps_end) * np.exp(-float(model.steps_done) / float(eps_decay))
         explore = (np.random.rand(obs_all.shape[0]) < cur_eps)
-        chosen = np.full((obs_all.shape[0],), 4, dtype=np.int64)
-        for i in range(obs_all.shape[0]):
-            if explore[i]:
+        chosen = greedy.copy()
+        if np.any(explore):
+            for i in np.where(explore)[0]:
                 valid_idx = np.where(masks_all[i] == 1)[0]
                 if len(valid_idx) == 0:
-                    chosen[i] = int(np.argmax(q_vals[i])) if np.all(np.isfinite(q_vals[i])) else 4
-                else:
-                    chosen[i] = int(np.random.choice(valid_idx))
-            else:
-                chosen[i] = int(np.nanargmax(q_vals[i])) if np.any(np.isfinite(q_vals[i])) else 4
+                    continue
+                chosen[i] = int(np.random.choice(valid_idx))
         # Update epsilon counter (per agent across all envs)
         model.steps_done += obs_all.shape[0]
         model.epsilon = eps_end + (eps_start - eps_end) * np.exp(-float(model.steps_done) / float(eps_decay))
@@ -381,7 +397,7 @@ def train_flat_dqn_subproc(
             avg_reward_ema = 0.98 * avg_reward_ema + 0.02 * step_reward_mean
 
         # Train
-        if step % update_freq == 0:
+        if step % eff_update_freq == 0:
             loss = model.train_step()
             if loss is not None:
                 last_loss = float(loss)
@@ -488,6 +504,7 @@ def train_nl_hmarl(
     # vectorized envs
     n_envs: int = 1,
 ):
+    _enable_torch_perf()
     """Train NL-HMARL manager with a simple A2C objective; workers use heuristic navigation during training.
 
     Notes:
@@ -701,6 +718,7 @@ def train_nl_hmarl_subproc(
     metrics_dir: str = 'results/train_metrics',
     metrics_tag: str = 'NL-HMARL',
 ):
+    _enable_torch_perf()
     import os
     import torch
     import numpy as np
@@ -881,6 +899,7 @@ def train_nl_hmarl_ac(
     # vectorized envs
     n_envs: int = 1,
 ):
+    _enable_torch_perf()
     """Train NL-HMARL with Actor-Critic workers.
 
     - Manager: same A2C as train_nl_hmarl
@@ -1141,6 +1160,7 @@ def train_nl_hmarl_ac_subproc(
     metrics_dir: str = 'results/train_metrics',
     metrics_tag: str = 'NL-HMARL-AC',
 ):
+    _enable_torch_perf()
     import os
     import torch
     import numpy as np

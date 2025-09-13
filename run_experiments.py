@@ -281,7 +281,7 @@ def main():
             # debug/viz
             verbose=debug_this,
             log_every=debug_cfg['log_every'],
-            save_plots=(debug_cfg['save_plots'] and debug_this),
+            save_plots=debug_cfg['save_plots'],
             plot_dir=debug_cfg['frames_dir'],
             plot_figsize=debug_cfg.get('frame_size'),
             plot_every=debug_cfg['plot_every'],

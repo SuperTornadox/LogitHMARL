@@ -462,8 +462,8 @@ class BatchTensorWarehouseEnv:
         sty = torch.gather(self.task_station[:, :, 1], 1, tid_safe)
         adj_shelf = (px - shx).abs() + (py - shy).abs() == 1
         adj_station = (px - stx).abs() + (py - sty).abs() == 1
-        # Pick：idle & ~carrying & has_task & adj_shelf
-        can_pick = idle_mask & (~self.carrying) & has_task & adj_shelf
+        # Pick：若本步结束后相邻货架且未携带、且有任务，则允许直接拾取（不再强制 IDLE）
+        can_pick = (~self.carrying) & has_task & adj_shelf
         req = torch.gather(self.task_req_car, 1, tid_safe)
         req = torch.where(has_task, req, torch.zeros_like(req))
         allowed_pick = can_pick & (~req | self.picker_is_forklift)
@@ -509,6 +509,12 @@ class BatchTensorWarehouseEnv:
               torch.full_like(w, float(drop_base.get('light', 1.5))) * cls_lt.float())
         drop_reward_mat = db * eff_sel + val
         rewards = rewards + torch.where(can_drop, drop_reward_mat.float(), torch.zeros_like(drop_reward_mat))
+        # 累计完成价值（用于评估汇总）
+        try:
+            val_add = torch.where(can_drop, val, torch.zeros_like(val)).sum(dim=1)
+            self.total_value_completed = self.total_value_completed + val_add.float()
+        except Exception:
+            pass
         late_pen = torch.where(cur_t > D, torch.full_like(val, float(self.rew_cfg.get('late_penalty', -5.0))), torch.zeros_like(val))
         rewards = rewards + torch.where(can_drop, late_pen, torch.zeros_like(late_pen))
         # 完成任务状态更新
@@ -671,8 +677,8 @@ class BatchTensorWarehouseEnv:
         # Apply pick state changes
         self.carrying = torch.where(allowed_pick, torch.ones_like(self.carrying), self.carrying)
 
-        # Drop rewards and state changes
-        can_drop = idle_mask & self.carrying & has_task & adj_station
+        # Drop：若本步结束后相邻站点且正在携带、且有任务，则直接投递（不再强制 IDLE）
+        can_drop = self.carrying & has_task & adj_station
         cur_t = self.current_time.view(B, 1).expand(B, N)
         base_val = torch.gather(self.task_value_base, 1, tid_safe).float()
         D = torch.gather(self.task_deadline_abs, 1, tid_safe).float()

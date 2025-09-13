@@ -12,7 +12,10 @@ import matplotlib.pyplot as plt
 
 # 评估参数（固定配置于 main，可以按需修改）
 eval_cfg = dict(
-    n_episodes=3,
+    # 为了并行评估，推荐将 episodes 固定为 1，
+    # 并用 eval_n_envs 控制并行度（等效于原先的多次 episodes 串行）。
+    n_episodes=1,
+    eval_n_envs=128,
     # 设为0表示不按订单数提前结束，让拣货员在同一集内连续执行多个任务
     target_orders=0,
     max_time_limit=30*60,#以step为单位
@@ -70,9 +73,6 @@ env_cfg = dict(
     },
 )
 
-
-
-
 # 训练参数（Flat-DQN）
 train_cfg = dict(
     training_steps=100,
@@ -122,7 +122,6 @@ nl_cfg = dict(
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
     deterministic_eval=True,
-    eval_n_envs=128,
     n_envs=256, # default to 256 when using tensor vecenv
 )
 
@@ -131,7 +130,6 @@ dqn_cfg = dict(
     device='cuda',  # 'auto' | 'cpu' | 'cuda' | 'cuda:0' | 'mps'
     n_envs=2048,
 )
-
 
 # 统一速度函数示例：
 # - 叉车(FORKLIFT)：移动速度恒为其 base_speed
@@ -185,7 +183,7 @@ def main():
         _env_ctor_tensor = None  # type: ignore
 
     methods = [
-        'NL-HMARL-AC',    # NL 管理层 + 工人层 A-C 学习
+        #'NL-HMARL-AC',    # NL 管理层 + 工人层 A-C 学习
         'NL-HMARL',       # NL 管理层 + 工人启发式移动
         #'Softmax',        # Softmax 管理层 + 工人启发式移动
         #'Softmax-AC',     # Softmax 管理层 + 工人层 A-C 学习
@@ -309,6 +307,7 @@ def main():
             assign_value_weight=0.05,
             # NL-HMARL training/eval config
             nl_cfg=nl_cfg,
+            eval_n_envs=eval_cfg.get('eval_n_envs', 1),
             # DQN training config
             dqn_cfg=dqn_cfg,
         )

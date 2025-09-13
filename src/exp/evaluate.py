@@ -422,7 +422,8 @@ def evaluate_method(method_name: str,
                 _nl_dev = 'cpu'
         det_eval = bool(nl_cfg_eval.get('deterministic_eval', False))
         max_tasks = int(nl_cfg_eval.get('max_tasks', getattr(model, 'n_tasks', 20)))
-        eval_envs = int(nl_cfg_eval.get('eval_n_envs', 1))
+        eval_envs = int(kwargs.get('eval_n_envs', 1))
+        _log_every = int(max(1, log_every))
         # Aggregate metrics across episodes
         results = []
         ep_bar = tqdm(range(n_episodes), desc=f"Eval {method_name} (tensor)", ncols=100)
@@ -435,8 +436,7 @@ def evaluate_method(method_name: str,
             except Exception:
                 pass
             # Rollout
-            step_bar = tqdm(range(max_time_limit), desc=f"Ep {ep+1}/{n_episodes}", ncols=100, leave=False)
-            for step_i in step_bar:
+            for step_i in range(max_time_limit):
                 feats = vec.get_features()
                 state = feats['state'].to(model.device)
                 task_feats = feats['task_feats'].to(model.device)
@@ -481,19 +481,17 @@ def evaluate_method(method_name: str,
                 a_mat = a_idx.view(B, N)
                 actions_per_env = [[int(a_mat[b, i].item()) for i in range(N)] for b in range(B)]
                 stp = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env)
-                # update step progress
-                try:
-                    mean_rew = float(stp['step_reward'].mean().item())
-                    step_bar.set_postfix(rew=f"{mean_rew:.2f}")
-                except Exception:
-                    pass
+                # throttle progress update: every _log_every steps
+                if (step_i % _log_every) == 0:
+                    try:
+                        mean_rew = float(stp['step_reward'].mean().item())
+                        ep_bar.set_postfix(ep=ep+1, step=step_i, rew=f"{mean_rew:.2f}")
+                    except Exception:
+                        pass
             # simple postfix per episode
+            # finalize episode postfix
             try:
-                ep_bar.set_postfix(ep=ep+1, steps=max_time_limit)
-            except Exception:
-                pass
-            try:
-                step_bar.close()
+                ep_bar.set_postfix(ep=ep+1, step=max_time_limit)
             except Exception:
                 pass
             # Collect episode metrics

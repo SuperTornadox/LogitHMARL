@@ -425,7 +425,8 @@ def evaluate_method(method_name: str,
         eval_envs = int(nl_cfg_eval.get('eval_n_envs', 1))
         # Aggregate metrics across episodes
         results = []
-        for ep in range(n_episodes):
+        ep_bar = tqdm(range(n_episodes), desc=f"Eval {method_name} (tensor)", ncols=100)
+        for ep in ep_bar:
             vec = TensorVecEnv(cfg, max_tasks=max_tasks, n_envs=int(max(1, eval_envs)), device=_nl_dev)
             # Warmup one step to spawn tasks
             try:
@@ -479,6 +480,11 @@ def evaluate_method(method_name: str,
                 a_mat = a_idx.view(B, N)
                 actions_per_env = [[int(a_mat[b, i].item()) for i in range(N)] for b in range(B)]
                 _ = vec.step_with_decisions_and_actions_tensor(per_env_decisions, actions_per_env)
+            # simple postfix per episode
+            try:
+                ep_bar.set_postfix(ep=ep+1, steps=max_time_limit)
+            except Exception:
+                pass
             # Collect episode metrics
             env_i = vec.env
             orders_completed = int(env_i.total_orders_completed.sum().item()) if hasattr(env_i, 'total_orders_completed') else 0

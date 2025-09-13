@@ -186,8 +186,8 @@ def main():
     methods = [
         'NL-HMARL-AC',    # NL 管理层 + 工人层 A-C 学习
         'NL-HMARL',       # NL 管理层 + 工人启发式移动
-        'Softmax',        # Softmax 管理层 + 工人启发式移动
-        'Softmax-AC',     # Softmax 管理层 + 工人层 A-C 学习
+        #'Softmax',        # Softmax 管理层 + 工人启发式移动
+        #'Softmax-AC',     # Softmax 管理层 + 工人层 A-C 学习
     ]
     print("methods: ", methods)
 

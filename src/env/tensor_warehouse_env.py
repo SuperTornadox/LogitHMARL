@@ -40,6 +40,15 @@ class TensorWarehouseEnv:
         self.current_task_st = None     # (N,2) long
         self.current_time = 0.0
         self.current_step = 0
+        # Optional external speed function to mimic classic env API
+        self.speed_fn = None  # callable(env) -> {picker_id: speed>0}
+
+    # API compatibility with classic env
+    def set_speed_function(self, fn):
+        if fn is None or not callable(fn):
+            raise TypeError("speed_function must be callable, with signature fn(env) -> {picker_id: speed}.")
+        self.speed_fn = fn
+        return self
 
     def _build_layout(self):
         H, W = self.height, self.width
@@ -138,15 +147,50 @@ class TensorWarehouseEnv:
         ny = self.picker_xy[:, 1] + dy[ext]
         inv = (nx < 0) | (ny < 0) | (nx >= W) | (ny >= H) | self.obstacle[ny.clamp(0, H - 1), nx.clamp(0, W - 1)]
         final_actions = torch.where(inv, greedy_actions, ext)
+        # Determine per-picker move steps via speed_function (if provided)
+        if self.speed_fn is not None:
+            # Try to get overrides from Python callable (CPU dict) and move to device tensor
+            try:
+                spd = self.speed_fn(self)
+            except Exception as e:
+                raise RuntimeError(f"speed_function failed: {e}")
+            if not isinstance(spd, dict):
+                raise RuntimeError("speed_function must return a dict {picker_id: speed}.")
+            speeds = torch.tensor([float(spd.get(i, 1.0)) for i in range(self.n_pickers)], dtype=torch.float32, device=self.device)
+            if torch.any(speeds <= 0):
+                bad = [i for i in range(self.n_pickers) if speeds[i].item() <= 0]
+                raise RuntimeError(f"speed_function returned non-positive speeds for pickers {bad}.")
+        else:
+            speeds = torch.ones((self.n_pickers,), dtype=torch.float32, device=self.device)
 
-        # Apply moves (allow overlap on free cells; block shelves)
-        nx = (self.picker_xy[:, 0] + dx[final_actions]).clamp(0, W - 1)
-        ny = (self.picker_xy[:, 1] + dy[final_actions]).clamp(0, H - 1)
-        move_ok = ~self.obstacle[ny, nx]
-        self.picker_xy = torch.stack([
-            torch.where(move_ok, nx, self.picker_xy[:, 0]),
-            torch.where(move_ok, ny, self.picker_xy[:, 1])
-        ], dim=1)
+        whole = torch.clamp(torch.floor(speeds), min=0).to(torch.long)
+        frac = torch.clamp(speeds - whole.float(), min=0.0)
+        extra = (torch.rand_like(frac) < frac).to(torch.long)
+        steps_to_move = whole + extra
+
+        # Apply moves (up to steps_to_move, allow overlap on free cells; block shelves)
+        cur_x = self.picker_xy[:, 0].clone()
+        cur_y = self.picker_xy[:, 1].clone()
+        max_steps = int(steps_to_move.max().item()) if self.n_pickers > 0 else 0
+        moved_cells = torch.zeros((self.n_pickers,), dtype=torch.long, device=self.device)
+        if max_steps > 0:
+            for s in range(max_steps):
+                alive = (steps_to_move > s) & (final_actions < 4)  # only moving actions
+                if not torch.any(alive):
+                    break
+                nx = (cur_x + dx[final_actions])
+                ny = (cur_y + dy[final_actions])
+                # Bounds and obstacle check
+                inb = (nx >= 0) & (ny >= 0) & (nx < W) & (ny < H)
+                ok = torch.zeros_like(alive)
+                if torch.any(inb & alive):
+                    nx_cl = nx.clamp(0, W - 1)
+                    ny_cl = ny.clamp(0, H - 1)
+                    ok = (~self.obstacle[ny_cl, nx_cl]) & alive & inb
+                cur_x = torch.where(ok, nx.clamp(0, W - 1), cur_x)
+                cur_y = torch.where(ok, ny.clamp(0, H - 1), cur_y)
+                moved_cells = moved_cells + ok.to(torch.long)
+        self.picker_xy = torch.stack([cur_x, cur_y], dim=1)
 
         # Pick/Drop on IDLE near shelf/station
         rewards: Dict[int, float] = {}
@@ -167,7 +211,7 @@ class TensorWarehouseEnv:
         self.current_task_st = torch.where(done_drop.unsqueeze(1), torch.full_like(self.current_task_st, -1), self.current_task_st)
         self.carrying = torch.where(done_drop, torch.zeros_like(self.carrying), self.carrying)
 
-        # Step reward: movement small bonus if reducing distance, idle penalty otherwise
+        # Step reward: movement small bonus, idle penalty otherwise
         curd = dist[self.picker_xy[:, 1], self.picker_xy[:, 0]]
         step_rew = torch.zeros((self.n_pickers,), dtype=torch.float32, device=self.device)
         step_rew = step_rew + pick_reward + drop_reward
@@ -183,4 +227,3 @@ class TensorWarehouseEnv:
         done = self.current_step >= self.max_steps
         dones = {i: done for i in range(self.n_pickers)}
         return self.get_global_state(), rewards, dones, info
-

@@ -1,0 +1,632 @@
+import torch
+from typing import Dict, List, Any, Tuple
+
+
+class BatchTensorWarehouseEnv:
+    """Batched tensorized warehouse env running entirely on a single device.
+
+    This class is designed to mimic the minimal interface used by NL-HMARL
+    subproc trainers via a vectorized wrapper: `get_features()` and
+    `assign_and_step` semantics.
+
+    Notes:
+      - This is a first functional version; full parity with the CPU env
+        (deadlines, value decay, congestion, energy) will be added in phases.
+      - Shapes:
+          B: batch_size (number of envs)
+          N: n_pickers
+          T: max_tasks
+      - Grid codes: 0 free, 2 shelf, 3 station
+    """
+
+    def __init__(self, env_config: Dict[str, Any], *, batch_size: int = 32, max_tasks: int = 20,
+                 device: str = 'cuda'):
+        self.cfg = dict(env_config)
+        self.B = int(batch_size)
+        self.T = int(max_tasks)
+        self.N = int(self.cfg.get('n_pickers', 8))
+        self.W = int(self.cfg.get('width', 32))
+        self.H = int(self.cfg.get('height', 32))
+        self.S = int(self.cfg.get('n_stations', 4))
+        self.time_step = float(self.cfg.get('time_step', 2.0))
+        self.episode_duration = float(self.cfg.get('episode_duration', 1.0))
+        self.max_steps = int(self.episode_duration * 3600.0 / self.time_step)
+
+        self.device = torch.device(device)
+        # Order config (scaled to simulation)
+        ocfg = dict(self.cfg.get('order_config', {}))
+        ocfg.setdefault('base_rate', 60.0)
+        ocfg.setdefault('peak_hours', [(9, 12), (14, 17), (19, 21)])
+        ocfg.setdefault('peak_multiplier', 1.6)
+        ocfg.setdefault('off_peak_multiplier', 0.7)
+        ocfg.setdefault('pattern_period_hours', 24)
+        ocfg.setdefault('scale_pattern_to_simulation', True)
+        ocfg['simulation_hours'] = self.episode_duration
+        self.order_cfg = ocfg
+        # Reward configuration (aligning gradually with classic env)
+        self.rew_cfg = {
+            'idle_penalty': -0.05,
+            'move_bonus': 0.05,
+            'move_toward_target': 0.1,
+            'late_penalty': -5.0,
+            'battery_low_penalty': -1.0,
+        }
+        # Weight thresholds + zone split
+        wth = self.cfg.get('weight_thresholds', {'medium': 30.0, 'heavy': 70.0, 'forklift_only': 90.0})
+        self.wt_medium = float(wth.get('medium', 30.0))
+        self.wt_heavy = float(wth.get('heavy', 70.0))
+        self.wt_forklift_only = float(wth.get('forklift_only', 90.0))
+        self.col_aisle = int(self.cfg.get('col_aisle', self.W // 2))
+        # Speed config（用于张量化速度/效率；若未提供则使用默认）
+        scfg = dict(self.cfg.get('speed_config', {
+            'base_speed': {'regular': 1.0, 'forklift': 1.2},
+            'carry_alpha': {'regular': 1.0, 'forklift': 0.5},
+            'congestion_mult': 0.7,
+        }))
+        self.base_speed_reg = float(scfg.get('base_speed', {}).get('regular', 1.0))
+        self.base_speed_fork = float(scfg.get('base_speed', {}).get('forklift', 1.2))
+        self.carry_alpha_reg = float(scfg.get('carry_alpha', {}).get('regular', 1.0))
+        self.carry_alpha_fork = float(scfg.get('carry_alpha', {}).get('forklift', 0.5))
+        # 拥堵减速：若提供 congestion_reduction 直接用；否则由 congestion_mult → reduction=1-congestion_mult
+        if 'congestion_reduction' in scfg:
+            self.congestion_red = float(scfg.get('congestion_reduction', 0.3))
+        else:
+            self.congestion_red = max(0.0, min(1.0, 1.0 - float(scfg.get('congestion_mult', 1.0))))
+
+        # Buffers initialized in reset
+        self.grid = None              # (B,H,W) int32
+        self.obstacle = None          # (B,H,W) bool (shelves)
+        self.stations = None          # (B,S,2) long
+        self.picker_xy = None         # (B,N,2) long
+        self.carrying = None          # (B,N) bool
+        self.current_task_idx = None  # (B,N) long, -1 if none
+        # Task pools (fixed cap T per env)
+        self.task_shelf = None        # (B,T,2) long
+        self.task_station = None      # (B,T,2) long
+        self.task_req_car = None      # (B,T) bool
+        self.task_status = None       # (B,T) long: 0=pending,1=assigned,2=done
+        self.task_assigned = None     # (B,T) long: picker idx or -1
+
+        self.current_time = None      # (B,) float
+        self.current_step = None      # (B,) long
+        self.battery = None           # (B,N) float
+        self.total_value_completed = None  # (B,) float
+
+        self.reset()
+
+    def _build_layout(self):
+        B, H, W, S = self.B, self.H, self.W, self.S
+        grid = torch.zeros((B, H, W), dtype=torch.int32, device=self.device)
+        # Regular shelf lanes: every 4th row except borders
+        for y in range(2, H - 2, 4):
+            grid[:, y, 2:W - 2] = 2
+        # Stations at bottom
+        xs = torch.linspace(1, W - 2, S, device=self.device).round().long()
+        ys = torch.full((S,), H - 2, dtype=torch.long, device=self.device)
+        # Broadcast stations per batch
+        st = torch.stack([xs, ys], dim=1).unsqueeze(0).expand(B, -1, -1).contiguous()
+        grid[torch.arange(B, device=self.device).unsqueeze(1), ys.unsqueeze(0).expand(B, -1), xs.unsqueeze(0).expand(B, -1)] = 3
+        self.grid = grid
+        self.obstacle = grid.eq(2)
+        self.stations = st
+
+    @torch.no_grad()
+    def reset(self):
+        self._build_layout()
+        B, N, H, W, T = self.B, self.N, self.H, self.W, self.T
+        # Spawn pickers on random free cells (avoid shelves)
+        self.picker_xy = torch.zeros((B, N, 2), dtype=torch.long, device=self.device)
+        for b in range(B):
+            free = (~self.obstacle[b]) & self.grid[b].ne(3)
+            fy, fx = free.nonzero(as_tuple=True)
+            perm = torch.randperm(fx.numel(), device=self.device)[:N]
+            sel = torch.stack([fx[perm], fy[perm]], dim=1)
+            self.picker_xy[b] = sel
+        self.carrying = torch.zeros((B, N), dtype=torch.bool, device=self.device)
+        self.current_task_idx = torch.full((B, N), -1, dtype=torch.long, device=self.device)
+        # Picker types (forklift vs regular)
+        self.picker_is_forklift = torch.zeros((B, N), dtype=torch.bool, device=self.device)
+        for b in range(B):
+            k = max(int(round(self.forklift_ratio * N)), self.min_forklifts)
+            k = min(max(0, k), N)
+            if k > 0:
+                idx = torch.randperm(N, device=self.device)[:k]
+                self.picker_is_forklift[b, idx] = True
+        # Initialize empty task buffers (status 3 = empty)
+        self.task_shelf = torch.full((B, T, 2), -1, dtype=torch.long, device=self.device)
+        self.task_station = torch.full((B, T, 2), -1, dtype=torch.long, device=self.device)
+        self.task_req_car = torch.zeros((B, T), dtype=torch.bool, device=self.device)
+        self.task_status = torch.full((B, T), 3, dtype=torch.long, device=self.device)
+        self.task_assigned = torch.full((B, T), -1, dtype=torch.long, device=self.device)
+        self.task_value_base = torch.zeros((B, T), dtype=torch.float32, device=self.device)
+        self.task_deadline_abs = torch.zeros((B, T), dtype=torch.float32, device=self.device)
+        self.task_arrival_time = torch.zeros((B, T), dtype=torch.float32, device=self.device)
+        self.task_priority = torch.zeros((B, T), dtype=torch.float32, device=self.device)
+        self.task_zone = torch.full((B, T), -1, dtype=torch.long, device=self.device)
+        self.task_weight = torch.zeros((B, T), dtype=torch.float32, device=self.device)
+        self.current_time = torch.zeros((B,), dtype=torch.float32, device=self.device)
+        self.current_step = torch.zeros((B,), dtype=torch.long, device=self.device)
+        self.battery = torch.full((B, N), 100.0, dtype=torch.float32, device=self.device)
+        self.total_value_completed = torch.zeros((B,), dtype=torch.float32, device=self.device)
+        self.total_orders_received = torch.zeros((B,), dtype=torch.long, device=self.device)
+        self.total_orders_completed = torch.zeros((B,), dtype=torch.long, device=self.device)
+        self.total_tasks_completed = torch.zeros((B,), dtype=torch.long, device=self.device)
+        self.on_time_completions = torch.zeros((B,), dtype=torch.long, device=self.device)
+        self.zone_loads = torch.zeros((B, 4), dtype=torch.float32, device=self.device)
+        return self.get_state_vec()  # (B,S)
+
+    @torch.no_grad()
+    def get_state_vec(self) -> torch.Tensor:
+        """构造与 CPU 版 get_global_state 等价的 81 维全局状态向量。
+        维度结构：
+        3（sin/cos/rate）+ 1（pending/100）+ 4（按重量 pending/50）+
+        64（zone×weight: cnt/20, avg_pri, 0.5, avg_rem）+
+        3（busy/bat_mean/forklift_busy）+ 4（zone load 占比）+
+        2（完成率/按时率）
+        """
+        B, T = self.B, self.T
+        # 时间 & 到达率
+        t = self.current_time % 24.0
+        s1 = torch.sin(t * 3.14159265 / 12.0)
+        s2 = torch.cos(t * 3.14159265 / 12.0)
+        rate = torch.tensor([self._arrival_rate(float(x)) for x in self.current_time.tolist()], device=self.device, dtype=torch.float32) / 100.0
+        # Pending 总数
+        pending_mask = (self.task_status == 0)
+        pending_norm = pending_mask.float().sum(dim=1) / 100.0
+        # 重量分类 masks（按阈值）
+        w = self.task_weight
+        fk = (w >= self.wt_forklift_only)
+        hv = (w >= self.wt_heavy) & (w < self.wt_forklift_only)
+        md = (w >= self.wt_medium) & (w < self.wt_heavy)
+        lt = (w < self.wt_medium)
+        # 按重量 pending 计数
+        wc_fk = (pending_mask & fk).float().sum(dim=1) / 50.0
+        wc_hv = (pending_mask & hv).float().sum(dim=1) / 50.0
+        wc_md = (pending_mask & md).float().sum(dim=1) / 50.0
+        wc_lt = (pending_mask & lt).float().sum(dim=1) / 50.0
+        # zone × 重量统计
+        z_summ = []
+        for z in range(4):
+            zmask = (self.task_zone == z)
+            for cls_mask in [fk, hv, md, lt]:
+                mask = pending_mask & zmask & cls_mask
+                cnt = mask.float().sum(dim=1) / 20.0
+                # 平均 priority / remaining_time
+                pri = torch.where(mask, self.task_priority, torch.zeros_like(self.task_priority))
+                rem = torch.clamp(self.task_deadline_abs - self.current_time.view(B, 1), min=0.0)
+                rem = torch.where(mask, rem, torch.zeros_like(rem))
+                denom = mask.float().sum(dim=1).clamp(min=1e-6)
+                avg_pri = pri.sum(dim=1) / denom
+                avg_rem = rem.sum(dim=1) / denom
+                z_summ.extend([cnt, avg_pri, torch.full_like(avg_pri, 0.5), avg_rem])
+        # 拣货员统计
+        busy_ratio = (self.current_task_idx >= 0).float().mean(dim=1)
+        bat_mean = self.battery.mean(dim=1) / 100.0
+        forklifts_total = self.picker_is_forklift.float().sum(dim=1).clamp(min=1.0)
+        forklifts_busy = (self.picker_is_forklift & (self.current_task_idx >= 0)).float().sum(dim=1) / forklifts_total
+        # Zone 负载占比
+        zl_total = self.zone_loads.sum(dim=1).clamp(min=1e-6)
+        zl = [self.zone_loads[:, i] / zl_total for i in range(4)]
+        # 绩效
+        perf1 = self.total_orders_completed.float() / self.total_orders_received.float().clamp(min=1.0)
+        perf2 = self.on_time_completions.float() / self.total_tasks_completed.float().clamp(min=1.0)
+        # 拼接
+        parts = [s1, s2, rate, pending_norm, wc_fk, wc_hv, wc_md, wc_lt] + z_summ + [busy_ratio, bat_mean, forklifts_busy] + zl + [perf1, perf2]
+        return torch.stack(parts, dim=1)
+
+    def _arrival_rate(self, time_hour: float) -> float:
+        period = float(max(1e-6, self.order_cfg.get('pattern_period_hours', 24)))
+        sim_h = float(max(1e-6, self.order_cfg.get('simulation_hours', 24)))
+        scale = bool(self.order_cfg.get('scale_pattern_to_simulation', False))
+        if scale:
+            t_sim = time_hour % sim_h
+            hour = (t_sim / sim_h) * period
+        else:
+            hour = time_hour % period
+        for s, e in self.order_cfg.get('peak_hours', []):
+            if s <= hour < e:
+                return float(self.order_cfg.get('base_rate', 60.0)) * float(self.order_cfg.get('peak_multiplier', 1.6))
+        if hour >= 22 or hour < 6:
+            return float(self.order_cfg.get('base_rate', 60.0)) * float(self.order_cfg.get('off_peak_multiplier', 0.7)) * 0.5
+        return float(self.order_cfg.get('base_rate', 60.0))
+
+    def _cls_name(self, b: int, tid: int) -> str:
+        """Map task weight to class name for reward scaling."""
+        w = float(self.task_weight[b, tid].item()) if hasattr(self, 'task_weight') else 0.0
+        if w >= self.wt_forklift_only:
+            return 'forklift_only'
+        if w >= self.wt_heavy:
+            return 'heavy'
+        if w >= self.wt_medium:
+            return 'medium'
+        return 'light'
+
+    @torch.no_grad()
+    def _spawn_new_tasks(self):
+        dt_h = self.time_step / 3600.0
+        B, T, W, H = self.B, self.T, self.W, self.H
+        for b in range(B):
+            lam = self._arrival_rate(float(self.current_time[b].item())) * dt_h
+            k = torch.poisson(torch.tensor([lam], device=self.device)).long().item()
+            if k <= 0:
+                continue
+            empties = torch.nonzero(self.task_status[b] >= 2, as_tuple=False).squeeze(1)
+            if empties.numel() <= 0:
+                continue
+            take = min(int(empties.numel()), k)
+            idx = empties[:take]
+            sx = torch.randint(0, W, (take,), device=self.device)
+            sy = torch.randint(0, H, (take,), device=self.device)
+            stx = torch.randint(0, W, (take,), device=self.device)
+            sty = torch.randint(0, H, (take,), device=self.device)
+            self.task_shelf[b, idx, 0] = sx
+            self.task_shelf[b, idx, 1] = sy
+            self.task_station[b, idx, 0] = stx
+            self.task_station[b, idx, 1] = sty
+            # values/deadlines/priority
+            base_val = torch.randint(50, 101, (take,), device=self.device).float()
+            self.task_value_base[b, idx] = base_val
+            dl = (torch.rand((take,), device=self.device) * 0.4 + 0.1)
+            self.task_deadline_abs[b, idx] = self.current_time[b] + dl
+            self.task_arrival_time[b, idx] = self.current_time[b]
+            self.task_priority[b, idx] = (torch.rand((take,), device=self.device) * 0.6 + 0.4)
+            # weight & requires_car
+            w = torch.rand((take,), device=self.device) * 100.0
+            self.task_weight[b, idx] = w
+            self.task_req_car[b, idx] = (w >= self.wt_forklift_only)
+            # zone
+            midy = self.H // 2
+            zx = (sx >= self.col_aisle).long()
+            zy = (sy >= midy).long()
+            self.task_zone[b, idx] = zy * 2 + zx
+            self.task_status[b, idx] = 0
+            # stats
+            self.total_orders_received[b] += take
+
+    @torch.no_grad()
+    def get_features(self) -> List[Dict[str, Any]]:
+        """Return per-env feature dicts matching SubprocVecEnv output keys."""
+        outs: List[Dict[str, Any]] = []
+        B, T = self.B, self.T
+        state_vec = self.get_state_vec()  # (B,S)
+        # Build per-env features
+        for b in range(B):
+            # task_feats: (T,5): shelf x,y normalized + dummy size + priority + remaining time
+            sh = self.task_shelf[b].clamp(min=0)
+            tf = torch.zeros((T, 5), dtype=torch.float32, device=self.device)
+            tf[:, 0] = torch.where(sh[:, 0] >= 0, sh[:, 0].float() / max(1, self.W), torch.zeros_like(sh[:, 0]).float())
+            tf[:, 1] = torch.where(sh[:, 1] >= 0, sh[:, 1].float() / max(1, self.H), torch.zeros_like(sh[:, 1]).float())
+            tf[:, 2] = 1.0
+            tf[:, 3] = self.task_priority[b]
+            rem = torch.clamp(self.task_deadline_abs[b] - self.current_time[b], min=0.0)
+            tf[:, 4] = rem
+            # task ids just 0..T-1
+            tids = torch.arange(T, device=self.device, dtype=torch.long)
+            requires = self.task_req_car[b]
+            free_pids = torch.nonzero((self.current_task_idx[b] < 0) & (~self.carrying[b]), as_tuple=False).squeeze(1)
+            outs.append({
+                'state_vec': state_vec[b].detach().cpu().numpy().astype('float32'),
+                'task_feats': tf.detach().cpu().numpy().astype('float32'),
+                'task_ids': tids.detach().cpu().numpy().astype('int64'),
+                'requires': requires.detach().cpu().numpy().astype('bool'),
+                'free_pids': free_pids.detach().cpu().numpy().astype('int64'),
+            })
+        return outs
+
+    @torch.no_grad()
+    def assign_and_step(self, per_env_decisions: List[List[Tuple[int, int]]]) -> List[Dict[str, Any]]:
+        """Apply decisions and step one time unit for all envs.
+
+        decisions[b] is a list of (pid, task_id) for env b.
+        """
+        B, N, T, H, W = self.B, self.N, self.T, self.H, self.W
+        # Spawn new tasks for this step
+        self._spawn_new_tasks()
+        # Apply assignments
+        for b in range(B):
+            if b >= len(per_env_decisions):
+                continue
+            for (pid, tid) in per_env_decisions[b]:
+                if not (0 <= pid < N and 0 <= tid < T):
+                    continue
+                if self.task_status[b, tid].item() != 0:  # not pending
+                    continue
+                if self.current_task_idx[b, pid].item() >= 0:  # already busy
+                    continue
+                self.task_status[b, tid] = 1  # assigned
+                self.task_assigned[b, tid] = int(pid)
+                self.current_task_idx[b, pid] = int(tid)
+
+        # Heuristic actions: move toward shelf when not carrying; else toward station
+        actions = torch.full((B, N), 4, dtype=torch.long, device=self.device)
+        dir_xy = torch.tensor([[0, -1], [0, 1], [-1, 0], [1, 0]], dtype=torch.long, device=self.device)
+
+        # One greedy step per picker
+        for b in range(B):
+            for i in range(N):
+                tid = self.current_task_idx[b, i].item()
+                if tid < 0:
+                    continue
+                tgt = self.task_shelf[b, tid] if not self.carrying[b, i] else self.task_station[b, tid]
+                # Choose direction minimizing L1 distance (avoid shelves)
+                px, py = self.picker_xy[b, i]
+                best_a = 4
+                best_d = 10 ** 9
+                for a in range(4):
+                    nx = px + dir_xy[a, 0]
+                    ny = py + dir_xy[a, 1]
+                    if nx < 0 or ny < 0 or nx >= W or ny >= H:
+                        continue
+                    if self.obstacle[b, ny, nx]:
+                        continue
+                    d = (tgt[0] - nx).abs().item() + (tgt[1] - ny).abs().item()
+                    if d < best_d:
+                        best_d = d
+                        best_a = a
+                # If adjacent, idle to trigger pick/drop
+                if (px - tgt[0]).abs().item() + (py - tgt[1]).abs().item() == 1:
+                    best_a = 4
+                actions[b, i] = best_a
+
+        # 计算每个拣货员的“本步可移动格数”（速度），并按方向执行多步移动
+        # 速度 = base_speed(type) * weight_term(task_weight) * (1 - congestion_red) * carry_alpha(若携带)
+        base_speed = torch.where(self.picker_is_forklift, torch.full((B, N), self.base_speed_fork, device=self.device), torch.full((B, N), self.base_speed_reg, device=self.device))
+        # 任务权重（若无任务则视为 0 → weight_term≈1）
+        wt = torch.zeros((B, N), dtype=torch.float32, device=self.device)
+        for b in range(B):
+            for i in range(N):
+                tid = int(self.current_task_idx[b, i].item())
+                if tid >= 0:
+                    wt[b, i] = float(self.task_weight[b, tid].item()) if hasattr(self, 'task_weight') else 0.0
+        thr_base = self.wt_forklift_only if self.wt_forklift_only is not None else self.wt_heavy
+        weight_term = torch.clamp((thr_base - wt + 10.0) / max(1e-6, (thr_base + 10.0)), 0.0, 2.0)
+        congest = torch.full((B, N), self.congestion_red, device=self.device)
+        eff = weight_term * (1.0 - congest)
+        carry_alpha = torch.where(self.picker_is_forklift, torch.full((B, N), self.carry_alpha_fork, device=self.device), torch.full((B, N), self.carry_alpha_reg, device=self.device))
+        eff = torch.where(self.carrying, eff * carry_alpha, eff)
+        speed = base_speed * eff
+        steps_int = torch.clamp(torch.floor(speed), min=0).to(torch.long)
+        frac = torch.clamp(speed - steps_int.float(), min=0.0)
+        extra = (torch.rand_like(frac) < frac).to(torch.long)
+        steps_to_move = steps_int + extra
+
+        # Apply actions（多步移动）并计算奖励
+        rewards = torch.zeros((B, N), dtype=torch.float32, device=self.device)
+        for b in range(B):
+            for i in range(N):
+                a = int(actions[b, i].item())
+                px = int(self.picker_xy[b, i, 0].item()); py = int(self.picker_xy[b, i, 1].item())
+                if a < 4:
+                    # 朝目标更近奖励：比较 old_dist 与 new_dist
+                    tid = int(self.current_task_idx[b, i].item())
+                    tgtx = tgty = None
+                    if tid >= 0:
+                        tgt = self.task_shelf[b, tid] if not self.carrying[b, i] else self.task_station[b, tid]
+                        tgtx = int(tgt[0].item()); tgty = int(tgt[1].item())
+                    smax = int(steps_to_move[b, i].item())
+                    for _ in range(max(1, smax)):
+                        nx = px + int(dir_xy[a, 0].item()); ny = py + int(dir_xy[a, 1].item())
+                        if nx < 0 or ny < 0 or nx >= W or ny >= H or bool(self.obstacle[b, ny, nx]):
+                            break
+                        old_dist = abs(px - (tgtx if tgtx is not None else px)) + abs(py - (tgty if tgty is not None else py)) if tid >= 0 else 0
+                        px, py = nx, ny
+                        new_dist = abs(px - (tgtx if tgtx is not None else px)) + abs(py - (tgty if tgty is not None else py)) if tid >= 0 else 0
+                        if tid >= 0 and new_dist < old_dist:
+                            rewards[b, i] += float(self.rew_cfg.get('move_toward_target', self.rew_cfg.get('move_bonus', 0.05)))
+                    self.picker_xy[b, i, 0] = px
+                    self.picker_xy[b, i, 1] = py
+                else:
+                    # IDLE: try pick/drop
+                    tid = self.current_task_idx[b, i].item()
+                    if tid >= 0:
+                        sh = self.task_shelf[b, tid]
+                        st = self.task_station[b, tid]
+                        # Pick if adjacent to shelf and not carrying
+                        if (not self.carrying[b, i]) and (abs(int(self.picker_xy[b, i, 0]) - int(sh[0])) + abs(int(self.picker_xy[b, i, 1]) - int(sh[1])) == 1):
+                            # forklift-only constraint
+                            req = bool(self.task_req_car[b, tid].item())
+                            if req and (not bool(self.picker_is_forklift[b, i].item())):
+                                rewards[b, i] += -0.5
+                            else:
+                                self.carrying[b, i] = True
+                                # scaled pick reward
+                                cls_name = self._cls_name(b, tid)
+                                pick_base = self.cfg.get('reward_config', {}).get('pick_base', {'forklift_only': 4.0, 'heavy': 3.0, 'medium': 2.0, 'light': 1.0})
+                                fork_eff = self.cfg.get('reward_config', {}).get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
+                                reg_eff = self.cfg.get('reward_config', {}).get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
+                                eff_type = fork_eff if bool(self.picker_is_forklift[b, i].item()) else reg_eff
+                                rewards[b, i] += float(pick_base.get(cls_name, 1.0) * eff_type.get(cls_name, 1.0))
+                        # Drop if adjacent to station and carrying
+                        if self.carrying[b, i] and (abs(int(self.picker_xy[b, i, 0]) - int(st[0])) + abs(int(self.picker_xy[b, i, 1]) - int(st[1])) == 1):
+                            self.carrying[b, i] = False
+                            # value/late rewards
+                            cur_t = float(self.current_time[b].item())
+                            base = float(self.task_value_base[b, tid].item())
+                            D = float(self.task_deadline_abs[b, tid].item())
+                            if cur_t <= D:
+                                val = base
+                            elif cur_t < 2 * D:
+                                val = base * (2 * D - cur_t) / max(1e-6, D)
+                            else:
+                                val = 0.0
+                            # scaled drop reward + value
+                            drop_base = self.cfg.get('reward_config', {}).get('drop_base', {'forklift_only': 5.0, 'heavy': 4.0, 'medium': 2.5, 'light': 1.5})
+                            fork_eff = self.cfg.get('reward_config', {}).get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
+                            reg_eff = self.cfg.get('reward_config', {}).get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
+                            cls_name = self._cls_name(b, tid)
+                            eff_type = fork_eff if bool(self.picker_is_forklift[b, i].item()) else reg_eff
+                            rewards[b, i] += float(drop_base.get(cls_name, 1.0) * eff_type.get(cls_name, 1.0)) + float(val)
+                            if cur_t > D:
+                                rewards[b, i] += self.rew_cfg['late_penalty']
+                            # Complete task
+                            self.task_status[b, tid] = 2
+                            self.task_assigned[b, tid] = -1
+                            self.current_task_idx[b, i] = -1
+                # idle penalty when action is IDLE
+                if a == 4:
+                    rewards[b, i] += self.rew_cfg['idle_penalty']
+
+        # Battery and congestion penalties
+        # Battery drains per move/idle
+        moved_mask = (actions < 4) | (steps_to_move > 0)
+        self.battery = self.battery - torch.where(moved_mask, torch.full_like(self.battery, 0.1), torch.full_like(self.battery, 0.05))
+        low = self.battery < 20.0
+        rewards = rewards + (low.float() * self.rew_cfg['battery_low_penalty'])
+        # Congestion: penalty if >1 other pickers within manhattan 1
+        for b in range(B):
+            for i in range(N):
+                px = int(self.picker_xy[b, i, 0].item()); py = int(self.picker_xy[b, i, 1].item())
+                crowd = 0
+                for j in range(N):
+                    if j == i: continue
+                    ox = int(self.picker_xy[b, j, 0].item()); oy = int(self.picker_xy[b, j, 1].item())
+                    if abs(ox - px) + abs(oy - py) <= 1:
+                        crowd += 1
+                if crowd > 1:
+                    rewards[b, i] += -0.5
+        # 区域均衡（全局奖励，按人头均摊）
+        total = self.zone_loads.sum(dim=1)
+        # 使用标准差作为不均衡度量，参考 CPU 版条件
+        std = torch.std(self.zone_loads, dim=1)
+        zb_bonus = float(self.cfg.get('reward_config', {}).get('zone_balance_bonus', 0.3))
+        mask_bal = (total > 0) & (std < torch.maximum(torch.full_like(total, 1.0), total * 0.1))
+        if mask_bal.any():
+            rewards[mask_bal] += (zb_bonus / max(1, N))
+
+        # Advance time
+        self.current_time += self.time_step / 3600.0
+        self.current_step += 1
+
+        outs: List[Dict[str, Any]] = []
+        st_vec = self.get_state_vec()  # (B,S)
+        done_b = (self.current_step >= self.max_steps)
+        for b in range(B):
+            outs.append({
+                'step_reward': float(rewards[b].sum().item()),
+                'next_state_vec': st_vec[b].detach().cpu().numpy().astype('float32'),
+                'rewards_vec': rewards[b].detach().cpu().numpy().astype('float32'),
+                'dones_vec': (torch.full((self.N,), float(done_b[b].item()), device=self.device)
+                              .cpu().numpy().astype('float32')),
+            })
+        return outs
+
+    @torch.no_grad()
+    def assign_and_step_with_actions(self, per_env_decisions: List[List[Tuple[int, int]]],
+                                     actions_per_env: List[List[int]]) -> List[Dict[str, Any]]:
+        """Apply decisions and low-level actions for workers, then step.
+
+        actions_per_env[b] is a list of length N with action ints per picker.
+        """
+        B, N, T, H, W = self.B, self.N, self.T, self.H, self.W
+        # Spawn new tasks then apply assignments
+        self._spawn_new_tasks()
+        # Apply assignments (same as above)
+        for b in range(B):
+            if b < len(per_env_decisions):
+                for (pid, tid) in per_env_decisions[b]:
+                    if 0 <= pid < N and 0 <= tid < T and self.task_status[b, tid].item() == 0 and self.current_task_idx[b, pid].item() < 0:
+                        self.task_status[b, tid] = 1
+                        self.task_assigned[b, tid] = int(pid)
+                        self.current_task_idx[b, pid] = int(tid)
+
+        dir_xy = torch.tensor([[0, -1], [0, 1], [-1, 0], [1, 0]], dtype=torch.long, device=self.device)
+        rewards = torch.zeros((B, N), dtype=torch.float32, device=self.device)
+        # Apply provided actions per env
+        for b in range(B):
+            acts = actions_per_env[b] if b < len(actions_per_env) else [4] * N
+            for i in range(N):
+                a = int(acts[i]) if i < len(acts) else 4
+                px, py = self.picker_xy[b, i]
+                if a < 4:
+                    nx = px + dir_xy[a, 0]
+                    ny = py + dir_xy[a, 1]
+                    if 0 <= nx < W and 0 <= ny < H and (not self.obstacle[b, ny, nx]):
+                        self.picker_xy[b, i, 0] = nx
+                        self.picker_xy[b, i, 1] = ny
+                        rewards[b, i] += self.rew_cfg['move_bonus']
+                else:
+                    tid = self.current_task_idx[b, i].item()
+                    if tid >= 0:
+                        sh = self.task_shelf[b, tid]
+                        st = self.task_station[b, tid]
+                        # Pick if adjacent to shelf and not carrying
+                        if (not self.carrying[b, i]) and (abs(int(self.picker_xy[b, i, 0]) - int(sh[0])) + abs(int(self.picker_xy[b, i, 1]) - int(sh[1])) == 1):
+                            req = bool(self.task_req_car[b, tid].item())
+                            if req and (not bool(self.picker_is_forklift[b, i].item())):
+                                rewards[b, i] += -0.5
+                            else:
+                                self.carrying[b, i] = True
+                                cls_name = self._cls_name(b, tid)
+                                pick_base = self.cfg.get('reward_config', {}).get('pick_base', {'forklift_only': 4.0, 'heavy': 3.0, 'medium': 2.0, 'light': 1.0})
+                                fork_eff = self.cfg.get('reward_config', {}).get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
+                                reg_eff = self.cfg.get('reward_config', {}).get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
+                                eff_type = fork_eff if bool(self.picker_is_forklift[b, i].item()) else reg_eff
+                                rewards[b, i] += float(pick_base.get(cls_name, 1.0) * eff_type.get(cls_name, 1.0))
+                        # Drop if adjacent to station and carrying
+                        if self.carrying[b, i] and (abs(int(self.picker_xy[b, i, 0]) - int(st[0])) + abs(int(self.picker_xy[b, i, 1]) - int(st[1])) == 1):
+                            self.carrying[b, i] = False
+                            cur_t = float(self.current_time[b].item())
+                            base = float(self.task_value_base[b, tid].item())
+                            D = float(self.task_deadline_abs[b, tid].item())
+                            if cur_t <= D:
+                                val = base
+                            elif cur_t < 2 * D:
+                                val = base * (2 * D - cur_t) / max(1e-6, D)
+                            else:
+                                val = 0.0
+                            drop_base = self.cfg.get('reward_config', {}).get('drop_base', {'forklift_only': 5.0, 'heavy': 4.0, 'medium': 2.5, 'light': 1.5})
+                            fork_eff = self.cfg.get('reward_config', {}).get('forklift_eff', {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1})
+                            reg_eff = self.cfg.get('reward_config', {}).get('regular_eff', {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0})
+                            cls_name = self._cls_name(b, tid)
+                            eff_type = fork_eff if bool(self.picker_is_forklift[b, i].item()) else reg_eff
+                            rewards[b, i] += float(drop_base.get(cls_name, 1.0) * eff_type.get(cls_name, 1.0)) + float(val)
+                            if cur_t > D:
+                                rewards[b, i] += self.rew_cfg['late_penalty']
+                            self.task_status[b, tid] = 2
+                            self.task_assigned[b, tid] = -1
+                            self.current_task_idx[b, i] = -1
+                if a == 4:
+                    rewards[b, i] += self.rew_cfg['idle_penalty']
+        # Battery and congestion
+        moved_mask = torch.zeros((B, N), dtype=torch.bool, device=self.device)
+        for b in range(B):
+            for i in range(N):
+                a = int(actions_per_env[b][i]) if (b < len(actions_per_env) and i < len(actions_per_env[b])) else 4
+                moved_mask[b, i] = (a < 4)
+        self.battery = self.battery - torch.where(moved_mask, torch.full_like(self.battery, 0.1), torch.full_like(self.battery, 0.05))
+        low = self.battery < 20.0
+        rewards = rewards + (low.float() * self.rew_cfg['battery_low_penalty'])
+        for b in range(B):
+            for i in range(N):
+                px = int(self.picker_xy[b, i, 0].item()); py = int(self.picker_xy[b, i, 1].item())
+                crowd = 0
+                for j in range(N):
+                    if j == i: continue
+                    ox = int(self.picker_xy[b, j, 0].item()); oy = int(self.picker_xy[b, j, 1].item())
+                    if abs(ox - px) + abs(oy - py) <= 1:
+                        crowd += 1
+                if crowd > 1:
+                    rewards[b, i] += -0.5
+        # 区域均衡（全局奖励）
+        total = self.zone_loads.sum(dim=1)
+        std = torch.std(self.zone_loads, dim=1)
+        zb_bonus = float(self.cfg.get('reward_config', {}).get('zone_balance_bonus', 0.3))
+        mask_bal = (total > 0) & (std < torch.maximum(torch.full_like(total, 1.0), total * 0.1))
+        if mask_bal.any():
+            rewards[mask_bal] += (zb_bonus / max(1, N))
+        # Advance time (single increment)
+        self.current_time += self.time_step / 3600.0
+        self.current_step += 1
+
+        outs: List[Dict[str, Any]] = []
+        st_vec = self.get_state_vec()
+        done_b = (self.current_step >= self.max_steps)
+        for b in range(B):
+            outs.append({
+                'step_reward': float(rewards[b].sum().item()),
+                'next_state_vec': st_vec[b].detach().cpu().numpy().astype('float32'),
+                'rewards_vec': rewards[b].detach().cpu().numpy().astype('float32'),
+                'dones_vec': (torch.full((self.N,), float(done_b[b].item()), device=self.device)
+                              .cpu().numpy().astype('float32')),
+            })
+        return outs

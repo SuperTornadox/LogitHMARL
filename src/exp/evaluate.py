@@ -154,7 +154,28 @@ def evaluate_method(method_name: str,
                 _nl_dev = 'cpu'
         # Train on a fresh env with same config (use subproc vecenv if n_envs>1)
         n_envs_cfg = int(nl_cfg.get('n_envs', 1))
-        if n_envs_cfg > 1:
+        if n_envs_cfg > 1 and bool(kwargs.get('use_tensor_env', False)):
+            print(f"[info] Using TensorVecEnv with n_envs={n_envs_cfg} for NL-HMARL")
+            from exp.trainers import train_nl_hmarl_tensorvec
+            model = train_nl_hmarl_tensorvec(
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr=float(nl_cfg.get('manager_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                n_envs=n_envs_cfg,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL',
+            )
+        elif n_envs_cfg > 1:
             print(f"[info] Using SubprocVecEnv with n_envs={n_envs_cfg} for NL-HMARL")
             model = train_nl_hmarl_subproc(
                 env_config=cfg,
@@ -212,7 +233,30 @@ def evaluate_method(method_name: str,
             except Exception:
                 _nl_dev = 'cpu'
         n_envs_cfg = int(nl_cfg.get('n_envs', 1))
-        if n_envs_cfg > 1:
+        if n_envs_cfg > 1 and bool(kwargs.get('use_tensor_env', False)):
+            print(f"[info] Using TensorVecEnv with n_envs={n_envs_cfg} for NL-HMARL-AC")
+            from exp.trainers import train_nl_hmarl_ac_tensorvec
+            model = train_nl_hmarl_ac_tensorvec(
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
+                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                n_envs=n_envs_cfg,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL-AC',
+            )
+        elif n_envs_cfg > 1:
             print(f"[info] Using SubprocVecEnv with n_envs={n_envs_cfg} for NL-HMARL-AC")
             from exp.trainers import train_nl_hmarl_ac_subproc
             model = train_nl_hmarl_ac_subproc(

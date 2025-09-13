@@ -124,7 +124,7 @@ nl_cfg = dict(
     train_log_every=max(1, train_cfg.get('training_steps', 1) // 200),
     # Evaluation
     deterministic_eval=False,
-    n_envs=_RECOMM_N_ENVS, # number of environments to train on
+    n_envs=(256 if True else _RECOMM_N_ENVS), # default to 256 when using tensor vecenv
 )
 
 # DQN hyperparameters (device only for now)
@@ -164,23 +164,26 @@ def main():
         sys.path.insert(0, src_dir)
 
     from exp.evaluate import evaluate_method
-    # 依据开关选择环境构造器
+    # 同时准备两种环境构造器，按方法选择使用
+    from env.dynamic_warehouse_env import DynamicWarehouseEnv
+    def _env_ctor_cpu(cfg):
+        return DynamicWarehouseEnv(cfg)
     if USE_TENSOR_ENV:
-        from env.tensor_warehouse_env import TensorWarehouseEnv  # type: ignore
-        def _env_ctor(cfg):
-            cfg = dict(cfg)
-            try:
-                import torch
-                dev = 'cuda' if torch.cuda.is_available() else 'cpu'
-            except Exception:
-                dev = 'cpu'
-            cfg['device'] = dev
-            print(f"[info] Using TensorWarehouseEnv ({dev})")
-            return TensorWarehouseEnv(cfg)
+        try:
+            from env.tensor_warehouse_env import TensorWarehouseEnv  # type: ignore
+            def _env_ctor_tensor(cfg):
+                cfg = dict(cfg)
+                try:
+                    import torch
+                    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+                except Exception:
+                    dev = 'cpu'
+                cfg['device'] = dev
+                return TensorWarehouseEnv(cfg)
+        except Exception:
+            _env_ctor_tensor = None  # type: ignore
     else:
-        from env.dynamic_warehouse_env import DynamicWarehouseEnv
-        def _env_ctor(cfg):
-            return DynamicWarehouseEnv(cfg)
+        _env_ctor_tensor = None  # type: ignore
 
     methods = [
         'NL-HMARL-AC',    # NL 管理层 + 工人层 A-C 学习
@@ -263,6 +266,13 @@ def main():
         print(f"\n>>> Evaluating {m} ...")
         # 单次配置，所有方法一致使用
         debug_this = debug_cfg['enable']
+        # 选择环境构造器：若开启张量环境且可用，则所有方法均使用 TensorWarehouseEnv
+        use_tensor_for_this = USE_TENSOR_ENV and (_env_ctor_tensor is not None)
+        env_ctor_selected = (_env_ctor_tensor if use_tensor_for_this else _env_ctor_cpu)
+        if use_tensor_for_this:
+            print('[info] Using TensorWarehouseEnv for', m)
+        else:
+            print('[info] Using DynamicWarehouseEnv for', m)
         r = evaluate_method(
             m,
             env_cfg['width'], env_cfg['height'], env_cfg['n_pickers'], env_cfg.get('n_shelves', 0), env_cfg['n_stations'],
@@ -281,8 +291,9 @@ def main():
             debug_first_episode_only=debug_cfg['debug_first_episode_only'],
             make_animation=debug_cfg['make_animation'],
             animation_fps=debug_cfg['animation_fps'],
-            # 直接使用环境构造器（CPU 动态/或 GPU 张量化）
-            env_ctor=_env_ctor,
+            # 直接使用环境构造器（按方法选择 CPU 动态/或 GPU 张量化）
+            env_ctor=env_ctor_selected,
+            use_tensor_env=USE_TENSOR_ENV,
             # 传递额外的环境配置，确保叉车生成
             env_extra={
                 'min_forklifts': env_cfg.get('min_forklifts', 0),

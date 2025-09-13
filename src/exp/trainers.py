@@ -302,7 +302,10 @@ def train_flat_dqn_subproc(
     q_logs = []
 
     include_global = not pure_learning
-    total_agents = int(max(2, n_envs)) * n_pickers
+    used_envs = int(max(2, n_envs))
+    total_agents = used_envs * n_pickers
+    import time as _time
+    _t0 = _time.time()
     for step in pbar:
         # Collect observations and masks from all envs
         outs = vec.get_dqn_obs(include_global=include_global)
@@ -397,7 +400,10 @@ def train_flat_dqn_subproc(
             q_logs.append(qm.tolist())
 
         try:
-            pbar.set_postfix(avgR=f"{avg_reward_ema:.2f}", loss=f"{(last_loss or 0):.3f}")
+            elapsed = max(1e-6, (_time.time() - _t0))
+            env_steps = (step + 1) * used_envs
+            sps = env_steps / elapsed
+            pbar.set_postfix(envs=used_envs, env_steps=env_steps, sps=f"{sps:.1f}", avgR=f"{avg_reward_ema:.2f}", loss=f"{(last_loss or 0):.3f}")
         except Exception:
             pass
 
@@ -701,7 +707,8 @@ def train_nl_hmarl_subproc(
     from tqdm import tqdm
     from baselines.nl_hmarl import NLHMARL
 
-    vec = SubprocVecEnv(int(max(2, n_envs)), env_config, max_tasks=max_tasks)
+    used_envs = int(max(2, n_envs))
+    vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
     f0 = vec.get_features()[0]
     state_dim = int(np.array(f0['state_vec'], dtype=np.float32).shape[0])
 
@@ -724,6 +731,8 @@ def train_nl_hmarl_subproc(
     steps_log, loss_log, reward_log = [], [], []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL (subproc)', ncols=100)
+    import time as _time
+    _t0 = _time.time()
     for step in pbar:
         feats_list = vec.get_features()
         per_env_decisions = [[] for _ in range(len(feats_list))]
@@ -803,7 +812,10 @@ def train_nl_hmarl_subproc(
             reward_log.append(mean_rew)
             pol_log.append(cur_pl); val_log.append(cur_vl); entL_log.append(cur_el); ent_log.append(cur_ent)
         try:
-            pbar.set_postfix(rew=f"{mean_rew:.2f}", loss=f"{(cur_loss if np.isfinite(cur_loss) else 0):.3f}")
+            elapsed = max(1e-6, (_time.time() - _t0))
+            env_steps = (step + 1) * used_envs
+            sps = env_steps / elapsed
+            pbar.set_postfix(envs=used_envs, env_steps=env_steps, sps=f"{sps:.1f}", rew=f"{mean_rew:.2f}", loss=f"{(cur_loss if np.isfinite(cur_loss) else 0):.3f}")
         except Exception:
             pass
 
@@ -1135,7 +1147,8 @@ def train_nl_hmarl_ac_subproc(
     from tqdm import tqdm
     from baselines.nl_hmarl import NLHMARL
 
-    vec = SubprocVecEnv(int(max(2, n_envs)), env_config, max_tasks=max_tasks)
+    used_envs = int(max(2, n_envs))
+    vec = SubprocVecEnv(used_envs, env_config, max_tasks=max_tasks)
     f0 = vec.get_features()[0]
     # Dimensions
     state_dim = int(np.array(f0['state_vec'], dtype=np.float32).shape[0])
@@ -1161,6 +1174,8 @@ def train_nl_hmarl_ac_subproc(
     steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
     m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (subproc)', ncols=100)
+    import time as _time
+    _t0 = _time.time()
 
     for step in pbar:
         feats_list = vec.get_features()
@@ -1291,7 +1306,10 @@ def train_nl_hmarl_ac_subproc(
             m_entL_log.append(cur_m_el)
             m_ent_log.append(cur_m_ent)
         try:
-            pbar.set_postfix(rew=f"{step_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
+            elapsed = max(1e-6, (_time.time() - _t0))
+            env_steps = (step + 1) * used_envs
+            sps = env_steps / elapsed
+            pbar.set_postfix(envs=used_envs, env_steps=env_steps, sps=f"{sps:.1f}", rew=f"{step_rew:.2f}", mL=f"{0 if not np.isfinite(cur_m_loss) else cur_m_loss:.3f}", wL=f"{cur_w_loss:.3f}")
         except Exception:
             pass
 

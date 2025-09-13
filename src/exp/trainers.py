@@ -2109,6 +2109,8 @@ def train_nl_hmarl_ac_tensorvec(
 
     steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
     m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
+    env_steps_log = []
+    used_envs = int(max(1, n_envs))
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC (tensorvec)', ncols=100)
     for step in pbar:
         feats = vec.get_features()

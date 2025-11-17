@@ -6,7 +6,13 @@
       "Bash(pip install:*)",
       "Bash(grep:*)",
       "Bash(python:*)",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Bash(kill:*)",
+      "Bash(pkill:*)",
+      "WebSearch",
+      "Bash(MODE=test python run_experiments.py:*)",
+      "Bash(tee:*)",
+      "Bash(find:*)"
     ],
     "deny": []
   }

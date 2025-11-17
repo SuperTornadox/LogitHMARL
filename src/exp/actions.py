@@ -1,5 +1,4 @@
 import numpy as np
-from collections import deque
 
 
 def convert_to_dynamic_actions(actions, env=None, input_space: str = 'env'):
@@ -147,38 +146,25 @@ def get_guided_exploration_action(env, picker, epsilon=0.5):
 
 
 def aisle_distance(env, start, goal):
-    """计算在通道（非货架格）内从 start 到 goal 的最短步数（BFS）。
-    若不可达，返回一个大数（1e9）。
+    """Manhattan距离近似（快速O(1)计算，忽略货架障碍）。
+
+    原实现：BFS搜索，精确但慢（O(W*H)）
+    新实现：Manhattan距离，快速但近似（O(1)）
+    根据RL研究，Manhattan距离在网格世界奖励塑形中效果很好
     """
     sx, sy = start
     gx, gy = goal
+    # 相同位置
     if (sx, sy) == (gx, gy):
         return 0
+    # 边界检查
     W, H = env.width, env.height
-    # 不可作为起点/终点的格：仅屏蔽货架（2）；站点等可通过
     if not (0 <= sx < W and 0 <= sy < H and 0 <= gx < W and 0 <= gy < H):
         return 10**9
+    # 货架检查（起点或终点在货架上视为不可达）
     if env.grid[sy, sx] == 2:
         return 10**9
     if env.grid[gy, gx] == 2:
-        # 目标如果是货架格，外部调用应传来相邻的可达格；此处视为不可达
         return 10**9
-    q = deque()
-    q.append((sx, sy, 0))
-    vis = [[False]*W for _ in range(H)]
-    vis[sy][sx] = True
-    while q:
-        x, y, d = q.popleft()
-        for dx, dy in ((0,1),(1,0),(0,-1),(-1,0)):
-            nx, ny = x+dx, y+dy
-            if not (0 <= nx < W and 0 <= ny < H):
-                continue
-            if vis[ny][nx]:
-                continue
-            if env.grid[ny, nx] == 2:  # 货架不可走
-                continue
-            if (nx, ny) == (gx, gy):
-                return d+1
-            vis[ny][nx] = True
-            q.append((nx, ny, d+1))
-    return 10**9
+    # Manhattan距离：|x1-x2| + |y1-y2|
+    return abs(gx - sx) + abs(gy - sy)

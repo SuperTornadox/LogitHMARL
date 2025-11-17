@@ -109,6 +109,17 @@ def get_global_state(env):
     total = sum(env.zone_loads)
     for z in range(4):
         state.append(env.zone_loads[z] / max(1, total))
+    # 区域拥堵加成（来自环境的时段化分区拥堵，0..1；不可用时填0）
+    try:
+        extras = []
+        for z in range(4):
+            if hasattr(env, '_zone_congestion_extra'):
+                extras.append(float(env._zone_congestion_extra(z)))
+            else:
+                extras.append(0.0)
+        state.extend(extras)
+    except Exception:
+        state.extend([0.0, 0.0, 0.0, 0.0])
     # 绩效
     state.extend([
         getattr(env, 'total_orders_completed', 0) / max(1, getattr(env, 'total_orders_received', 1)),
@@ -137,12 +148,31 @@ def get_task_features(env, max_tasks=20, pending_only: bool = True):
         if t.shelf_id is not None and t.shelf_id < len(env.shelves):
             sh = env.shelves[t.shelf_id]
             shx, shy = sh['x'] / env.width, sh['y'] / env.height
+        # 第3维：是否需要叉车 (requires_car)
+        try:
+            req_car = 1.0 if bool(getattr(t, 'requires_car', False)) else 0.0
+        except Exception:
+            req_car = 0.0
+        # 新增：到最近“空闲拣货员”的曼哈顿距离（归一化）。空闲定义：无当前任务且未携货。
+        try:
+            sx = int(sh['x']) if t.shelf_id is not None and t.shelf_id < len(env.shelves) else int(round(shx * env.width))
+            sy = int(sh['y']) if t.shelf_id is not None and t.shelf_id < len(env.shelves) else int(round(shy * env.height))
+            free_pickers = [p for p in env.pickers if getattr(p, 'current_task', None) is None and len(getattr(p, 'carrying_items', [])) == 0]
+            if free_pickers:
+                d_min = min(abs(p.x - sx) + abs(p.y - sy) for p in free_pickers)
+            else:
+                d_min = 0
+            # 归一化到 [0,1]，以 (width+height) 为尺度
+            dist_norm = float(d_min) / max(1.0, float(env.width + env.height))
+        except Exception:
+            dist_norm = 0.0
         feats.append([
             shx, shy,
-            1.0,  # 大小占位
+            float(req_car),
             t.priority,
-            max(0.0, t.deadline - env.current_time)
+            max(0.0, t.deadline - env.current_time),
+            dist_norm,
         ])
     while len(feats) < max_tasks:
-        feats.append([0.0, 0.0, 0.0, 0.0, 0.0])
+        feats.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
     return np.array(feats[:max_tasks], dtype=np.float32)

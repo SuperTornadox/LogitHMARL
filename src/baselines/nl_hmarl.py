@@ -27,8 +27,8 @@ class NLManager(nn.Module):
         self.n_nests = n_nests
         self.learn_eta = learn_eta
 
-        # Task embedding from 5 features
-        self.task_embedder = nn.Linear(5, embed_dim)
+        # Task embedding from 6 features
+        self.task_embedder = nn.Linear(6, embed_dim)
 
         # Utility MLP over [global_state, task_embed]
         self.task_utility_net = nn.Sequential(
@@ -88,7 +88,10 @@ class NLManager(nn.Module):
             u = utils[b]  # [T]
             nid = nest_ids[b]  # [T]
             mask = task_mask[b] if task_mask is not None else torch.ones_like(u, dtype=torch.bool)
-            # Upper level: U_m = eta_m * log(sum_j exp(u_j / eta_m)) over tasks in nest m
+            # Upper level (size-normalized):
+            # U_m = mval + eta_m * ( log( Σ_j exp((u_j - mval)/eta_m) ) - log(|N_m|) )
+            # This uses log-mean-exp to reduce pure count effects (many decoys),
+            # highlighting nest structure rather than nest size.
             U_m = []
             for m in range(M):
                 eta_m = etas[m]
@@ -97,8 +100,10 @@ class NLManager(nn.Module):
                     vals = u[idx]
                     mval = torch.max(vals)
                     lse_in = torch.log(torch.clamp(torch.sum(torch.exp((vals - mval) / eta_m)), min=1e-12))
-                    # eta*log(sum exp(v/eta)) computed stably: mval + eta*log(sum exp((v-mval)/eta))
-                    U_m.append(mval + eta_m * lse_in)
+                    count = torch.clamp(idx.float().sum(), min=1.0)
+                    lse_mean = lse_in - torch.log(count)
+                    # mval + eta*log-mean-exp((v-mval)/eta)
+                    U_m.append(mval + eta_m * lse_mean)
                 else:
                     U_m.append(torch.tensor(-1e9, device=u.device))
             U = torch.stack(U_m)  # [M]
@@ -133,7 +138,28 @@ class NLManager(nn.Module):
                     task_mask: Optional[torch.Tensor] = None,
                     deterministic: bool = False) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         outs = self.forward(state, task_features, nest_ids, task_mask)
-        probs = outs['task_probs']
+        probs = outs['task_probs']  # [B,T]
+        # Sanitize probabilities: remove NaN/Inf/negatives, re-normalize; fallback to uniform over valid mask
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = torch.clamp(probs, min=0.0)
+        sums = probs.sum(dim=1, keepdim=True)
+        if task_mask is not None:
+            # Ensure masked positions remain zero
+            probs = probs * task_mask.float()
+            sums = probs.sum(dim=1, keepdim=True)
+        # Rows with zero sum → uniform over valid tasks
+        zero_rows = (sums <= 1e-12).squeeze(1)
+        if zero_rows.any():
+            if task_mask is not None:
+                valid_counts = task_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+                uniform = (task_mask.float() / valid_counts)
+            else:
+                T = probs.shape[1]
+                uniform = torch.full_like(probs, 1.0 / max(1, T))
+            probs[zero_rows] = uniform[zero_rows]
+            sums = probs.sum(dim=1, keepdim=True)
+        # Normalize
+        probs = probs / sums.clamp(min=1e-12)
         if deterministic:
             idx = probs.argmax(dim=1)
         else:

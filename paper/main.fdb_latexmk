@@ -1,14 +1,14 @@
 # Fdb version 4
-["bibtex main"] 1756813581.51107 "main.aux" "main.bbl" "main" 1756813647.16725 0
+["bibtex main"] 1756813581.51107 "main.aux" "main.bbl" "main" 1763345830.48015 0
   "./refs.bib" 1756693276.63307 3947 4af72dd49b40a120b51c8e0b5b4b5cba ""
   "/usr/local/texlive/2025/texmf-dist/bibtex/bst/ieeetran/IEEEtranN.bst" 1440712899 63583 d34cb6c328acc69716207f4a3421ad46 ""
-  "main.aux" 1756813646.87008 6385 cf83ea2ae7ee13aeb691310167232604 "pdflatex"
+  "main.aux" 1763345830.19317 6385 cf83ea2ae7ee13aeb691310167232604 "pdflatex"
   (generated)
   "main.bbl"
   "main.blg"
   (rewritten before read)
-["pdflatex"] 1756813646.13055 "/Users/hexuchen/Desktop/LogitHMARL/main/main.tex" "main.pdf" "main" 1756813647.1674 0
-  "/Users/hexuchen/Desktop/LogitHMARL/main/main.tex" 1756813643.08095 29435 f7dbf25d3263399f79d4884a171e15ba ""
+["pdflatex"] 1763345829.49428 "/Users/hexuchen/Desktop/LogitHMARL/paper/main.tex" "main.pdf" "main" 1763345830.48029 0
+  "/Users/hexuchen/Desktop/LogitHMARL/paper/main.tex" 1756813643.08095 29435 f7dbf25d3263399f79d4884a171e15ba ""
   "/usr/local/texlive/2025/texmf-dist/fonts/enc/dvips/base/8r.enc" 1165713224 4850 80dc9bab7f31fb78a000ccfed0e27cab ""
   "/usr/local/texlive/2025/texmf-dist/fonts/map/fontname/texfonts.map" 1577235249 3524 cb3e574dea2d1052e39280babc910dc8 ""
   "/usr/local/texlive/2025/texmf-dist/fonts/tfm/adobe/times/ptmb7t.tfm" 1136768653 2172 fd0c924230362ff848a33632ed45dc23 ""
@@ -133,9 +133,9 @@
   "/usr/local/texlive/2025/texmf-var/fonts/map/pdftex/updmap/pdftex.map" 1756648346 5467155 19efa205003f9ecad95fbbaa6ff24da1 ""
   "/usr/local/texlive/2025/texmf-var/web2c/pdftex/pdflatex.fmt" 1741450574 3345740 46b66fdb0378f7bf5921b5eabf1762b8 ""
   "/usr/local/texlive/2025/texmf.cnf" 1741450484 577 418a7058ec8e006d8704f60ecd22c938 ""
-  "main.aux" 1756813646.87008 6385 cf83ea2ae7ee13aeb691310167232604 "pdflatex"
+  "main.aux" 1763345830.19317 6385 cf83ea2ae7ee13aeb691310167232604 "pdflatex"
   "main.bbl" 1756813581.6382 4048 f0bb58942ad1e4f233bcaa269bd87a98 "bibtex main"
-  "main.out" 1756813646.87068 3509 2242cafc6af4095179c3713b75774bd9 "pdflatex"
+  "main.out" 1763345830.19384 3509 2242cafc6af4095179c3713b75774bd9 "pdflatex"
   "main.tex" 1756813643.08095 29435 f7dbf25d3263399f79d4884a171e15ba ""
   (generated)
   "main.aux"

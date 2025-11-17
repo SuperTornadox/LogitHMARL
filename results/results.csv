@@ -1,0 +1,10 @@
+method,raw_value,decayed_value,total_value,penalty
+Softmax,10172,10063,9879,293
+Softmax-AC,3682,3682,3682,0
+DQN-Guided,176,176,-88,264
+DQN-Pure,1968,1968,1878,90
+Optimal,17030,17021,17021,9
+NL-HMARL,1345,1345,1345,0
+NL-HMARL-AC,90,90,90,0
+S-Shape,992,992,992,0
+Return,1422,1422,1422,0

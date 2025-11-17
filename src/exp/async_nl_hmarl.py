@@ -235,35 +235,33 @@ class NLHMARLAsyncAdapter:
 
                 # ===== 收集Manager数据 =====
                 all_manager_decisions = []
-                all_manager_rewards = []
-                all_next_states = []
+                all_manager_exp_idx = []  # 记录每个decision属于哪个experience
 
-                for exp in batch:
-                    all_manager_decisions.extend(exp['manager_decisions'])
-                    if exp['manager_decisions']:
-                        all_manager_rewards.append(exp['manager_reward'])
-                        all_next_states.append(exp['next_state'])
+                for exp_idx, exp in enumerate(batch):
+                    for d in exp['manager_decisions']:
+                        all_manager_decisions.append(d)
+                        all_manager_exp_idx.append(exp_idx)
 
                 # ===== Manager训练 =====
                 manager_loss = 0.0
                 manager_metrics = {}
 
                 if all_manager_decisions:
-                    # 构造批量tensor
+                    # 构造批量tensor（正确的3D形状）
                     batch_states = torch.tensor(
-                        np.vstack([d['state'] for d in all_manager_decisions]),
+                        np.array([d['state'] for d in all_manager_decisions]),
                         dtype=torch.float32, device=self.device
                     )
                     batch_tf = torch.tensor(
-                        np.vstack([d['task_feats'] for d in all_manager_decisions]),
+                        np.array([d['task_feats'] for d in all_manager_decisions]),
                         dtype=torch.float32, device=self.device
                     )
                     batch_nid = torch.tensor(
-                        np.vstack([d['nest_ids'] for d in all_manager_decisions]),
+                        np.array([d['nest_ids'] for d in all_manager_decisions]),
                         dtype=torch.long, device=self.device
                     )
                     batch_mask = torch.tensor(
-                        np.vstack([d['mask'] for d in all_manager_decisions]),
+                        np.array([d['mask'] for d in all_manager_decisions]),
                         dtype=torch.bool, device=self.device
                     )
                     batch_idx = torch.tensor(
@@ -271,16 +269,17 @@ class NLHMARLAsyncAdapter:
                         dtype=torch.long, device=self.device
                     )
 
-                    # 计算returns
+                    # 计算returns（为每个decision使用对应experience的reward和next_state）
                     returns_list = []
-                    for i, mr in enumerate(all_manager_rewards):
-                        next_state = torch.tensor(all_next_states[i], dtype=torch.float32, device=self.device).unsqueeze(0)
+                    for d_idx, exp_idx in enumerate(all_manager_exp_idx):
+                        exp = batch[exp_idx]
+                        mr = exp['manager_reward']
+                        next_state = torch.tensor(exp['next_state'], dtype=torch.float32, device=self.device).unsqueeze(0)
+
                         with torch.no_grad():
                             v_next = model.value_net(next_state).squeeze().item()
 
-                        # 每个决策都用相同的reward
-                        n_decisions_in_exp = sum(1 for d in all_manager_decisions if np.array_equal(d['state'], all_next_states[i]))
-                        returns_list.extend([mr + self.gamma * v_next] * n_decisions_in_exp)
+                        returns_list.append(mr + self.gamma * v_next)
 
                     returns = torch.tensor(returns_list, dtype=torch.float32, device=self.device)
 

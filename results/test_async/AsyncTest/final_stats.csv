@@ -1,0 +1,2 @@
+collect_steps,train_steps,total_experiences,avg_loss,gpu_utilization,queue_size,total_added,total_sampled
+3437,107,3437,0.4327495924625734,0.0,13,3437,3424

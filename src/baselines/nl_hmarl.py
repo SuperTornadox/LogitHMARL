@@ -167,7 +167,7 @@ class NLManager(nn.Module):
         return idx, outs
 
 
-class NLHMARL:
+class NLHMARL(nn.Module):
     """Container for NL manager + worker policy and value head for manager."""
 
     def __init__(self,
@@ -181,6 +181,7 @@ class NLHMARL:
                  device: str = 'cpu',
                  learn_eta: bool = False,
                  eta_init: float = 1.0):
+        super().__init__()
         import torch
         from models.worker_policy import MultiAgentWorkerPolicy
 

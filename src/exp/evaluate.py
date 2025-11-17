@@ -107,33 +107,70 @@ def evaluate_method(method_name: str,
                                speed_function=speed_function,
                                device=_dev)
     elif method_name in ('NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC') and env_ctor is not None:
-        from exp.trainers import train_nl_hmarl_ac
+        import os as _os
+        use_async = _os.environ.get('USE_ASYNC', 'false').lower() == 'true'
+
         nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
         _nl_dev = str(nl_cfg.get('device', 'cpu'))
         if _nl_dev.lower() == 'auto':
             _nl_dev = 'cpu'
-        model = train_nl_hmarl_ac(
-            env_ctor=env_ctor,
-            env_config=cfg,
-            training_steps=training_steps,
-            hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
-            lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
-            lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
-            max_tasks=int(nl_cfg.get('max_tasks', 20)),
-            gamma=float(nl_cfg.get('gamma', 0.99)),
-            entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
-            entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
-            n_nests=int(nl_cfg.get('n_nests', 4)),
-            learn_eta=bool(nl_cfg.get('learn_eta', False)),
-            eta_init=float(nl_cfg.get('eta_init', 1.0)),
-            device=_nl_dev,
-            speed_function=speed_function,
-            log_metrics=True,
-            log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
-            metrics_dir='results/train_metrics',
-            metrics_tag='NL-HMARL-AC',
-            n_envs=1,
-        )
+
+        # 根据环境变量选择异步或串行训练
+        if use_async:
+            from exp.train_nl_hmarl_ac_async import train_nl_hmarl_ac_async
+            print(f"\n🚀 Using async training for {method_name} (3-4x faster)")
+            model = train_nl_hmarl_ac_async(
+                env_ctor=env_ctor,
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
+                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                speed_function=speed_function,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL-AC-Async',
+                # 异步训练参数
+                n_envs=int(_os.environ.get('N_ENVS', 16)),
+                batch_size=int(_os.environ.get('ASYNC_BATCH_SIZE', 256)),
+                buffer_size=int(_os.environ.get('ASYNC_BUFFER_SIZE', 50000)),
+                update_interval=int(_os.environ.get('ASYNC_UPDATE_INTERVAL', 10)),
+                num_collect_threads=int(_os.environ.get('ASYNC_COLLECT_THREADS', 4)),
+            )
+        else:
+            from exp.trainers import train_nl_hmarl_ac
+            print(f"\n📌 Using serial training for {method_name} (legacy mode)")
+            model = train_nl_hmarl_ac(
+                env_ctor=env_ctor,
+                env_config=cfg,
+                training_steps=training_steps,
+                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
+                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
+                max_tasks=int(nl_cfg.get('max_tasks', 20)),
+                gamma=float(nl_cfg.get('gamma', 0.99)),
+                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
+                n_nests=int(nl_cfg.get('n_nests', 4)),
+                learn_eta=bool(nl_cfg.get('learn_eta', False)),
+                eta_init=float(nl_cfg.get('eta_init', 1.0)),
+                device=_nl_dev,
+                speed_function=speed_function,
+                log_metrics=True,
+                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+                metrics_dir='results/train_metrics',
+                metrics_tag='NL-HMARL-AC',
+                n_envs=1,
+            )
     elif method_name in ('Softmax-AC', 'SOFTMAX-AC') and env_ctor is not None:
         from exp.trainers import train_softmax_hmarl_ac
         sm_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}

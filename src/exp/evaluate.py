@@ -107,70 +107,35 @@ def evaluate_method(method_name: str,
                                speed_function=speed_function,
                                device=_dev)
     elif method_name in ('NL-HMARL-AC', 'NLHMARL-AC', 'NL_HMARL_AC') and env_ctor is not None:
-        import os as _os
-        use_async = _os.environ.get('USE_ASYNC', 'false').lower() == 'true'
-
+        from exp.trainers import train_nl_hmarl_ac
         nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
         _nl_dev = str(nl_cfg.get('device', 'cpu'))
         if _nl_dev.lower() == 'auto':
             _nl_dev = 'cpu'
 
-        # 根据环境变量选择异步或串行训练
-        if use_async:
-            from exp.train_nl_hmarl_ac_async import train_nl_hmarl_ac_async
-            print(f"\n🚀 Using async training for {method_name} (3-4x faster)")
-            model = train_nl_hmarl_ac_async(
-                env_ctor=env_ctor,
-                env_config=cfg,
-                training_steps=training_steps,
-                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
-                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
-                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
-                max_tasks=int(nl_cfg.get('max_tasks', 20)),
-                gamma=float(nl_cfg.get('gamma', 0.99)),
-                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
-                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
-                n_nests=int(nl_cfg.get('n_nests', 4)),
-                learn_eta=bool(nl_cfg.get('learn_eta', False)),
-                eta_init=float(nl_cfg.get('eta_init', 1.0)),
-                device=_nl_dev,
-                speed_function=speed_function,
-                log_metrics=True,
-                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
-                metrics_dir='results/train_metrics',
-                metrics_tag='NL-HMARL-AC-Async',
-                # 异步训练参数
-                n_envs=int(_os.environ.get('N_ENVS', 16)),
-                batch_size=int(_os.environ.get('ASYNC_BATCH_SIZE', 256)),
-                buffer_size=int(_os.environ.get('ASYNC_BUFFER_SIZE', 50000)),
-                update_interval=int(_os.environ.get('ASYNC_UPDATE_INTERVAL', 10)),
-                num_collect_threads=int(_os.environ.get('ASYNC_COLLECT_THREADS', 4)),
-            )
-        else:
-            from exp.trainers import train_nl_hmarl_ac
-            print(f"\n📌 Using serial training for {method_name} (legacy mode)")
-            model = train_nl_hmarl_ac(
-                env_ctor=env_ctor,
-                env_config=cfg,
-                training_steps=training_steps,
-                hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
-                lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
-                lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
-                max_tasks=int(nl_cfg.get('max_tasks', 20)),
-                gamma=float(nl_cfg.get('gamma', 0.99)),
-                entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
-                entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
-                n_nests=int(nl_cfg.get('n_nests', 4)),
-                learn_eta=bool(nl_cfg.get('learn_eta', False)),
-                eta_init=float(nl_cfg.get('eta_init', 1.0)),
-                device=_nl_dev,
-                speed_function=speed_function,
-                log_metrics=True,
-                log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
-                metrics_dir='results/train_metrics',
-                metrics_tag='NL-HMARL-AC',
-                n_envs=1,
-            )
+        print(f"\n📌 Using synchronous training for {method_name}")
+        model = train_nl_hmarl_ac(
+            env_ctor=env_ctor,
+            env_config=cfg,
+            training_steps=training_steps,
+            hidden_dim=int(nl_cfg.get('hidden_dim', hidden_dim)),
+            lr_manager=float(nl_cfg.get('manager_lr', learning_rate)),
+            lr_workers=float(nl_cfg.get('worker_lr', learning_rate)),
+            max_tasks=int(nl_cfg.get('max_tasks', 20)),
+            gamma=float(nl_cfg.get('gamma', 0.99)),
+            entropy_coef_manager=float(nl_cfg.get('entropy_coef_manager', 0.01)),
+            entropy_coef_workers=float(nl_cfg.get('entropy_coef_workers', 0.01)),
+            n_nests=int(nl_cfg.get('n_nests', 4)),
+            learn_eta=bool(nl_cfg.get('learn_eta', False)),
+            eta_init=float(nl_cfg.get('eta_init', 1.0)),
+            device=_nl_dev,
+            speed_function=speed_function,
+            log_metrics=True,
+            log_every=int(nl_cfg.get('train_log_every', max(1, training_steps // 200))),
+            metrics_dir='results/train_metrics',
+            metrics_tag='NL-HMARL-AC',
+            n_envs=1,
+        )
     elif method_name in ('Softmax-AC', 'SOFTMAX-AC') and env_ctor is not None:
         from exp.trainers import train_softmax_hmarl_ac
         sm_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
@@ -196,6 +161,54 @@ def evaluate_method(method_name: str,
             metrics_tag='Softmax-HMARL-AC',
             n_envs=1,
         )
+    elif method_name in ('NL-HMARL', 'NLHMARL', 'NL_HMARL') and env_ctor is not None:
+        from exp.trainers import train_nl_hmarl
+        nl_base_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
+        _dev = str(nl_base_cfg.get('device', 'cpu'))
+        if _dev.lower() == 'auto':
+            _dev = 'cpu'
+        model = train_nl_hmarl(
+            env_ctor=env_ctor,
+            env_config=cfg,
+            training_steps=training_steps,
+            hidden_dim=int(nl_base_cfg.get('hidden_dim', hidden_dim)),
+            lr=float(nl_base_cfg.get('manager_lr', learning_rate)),
+            max_tasks=int(nl_base_cfg.get('max_tasks', 20)),
+            gamma=float(nl_base_cfg.get('gamma', 0.99)),
+            update_every=int(nl_base_cfg.get('update_every', 8)),
+            entropy_coef=float(nl_base_cfg.get('entropy_coef_manager', 0.01)),
+            device=_dev,
+            speed_function=speed_function,
+            log_metrics=True,
+            log_every=int(nl_base_cfg.get('train_log_every', max(1, training_steps // 200))),
+            metrics_dir='results/train_metrics',
+            metrics_tag='NL-HMARL',
+            n_envs=1,
+        )
+    elif method_name in ('Softmax', 'SOFTMAX') and env_ctor is not None:
+        from exp.trainers import train_softmax_hmarl
+        sm_base_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
+        _dev = str(sm_base_cfg.get('device', 'cpu'))
+        if _dev.lower() == 'auto':
+            _dev = 'cpu'
+        model = train_softmax_hmarl(
+            env_ctor=env_ctor,
+            env_config=cfg,
+            training_steps=training_steps,
+            hidden_dim=int(sm_base_cfg.get('hidden_dim', hidden_dim)),
+            lr=float(sm_base_cfg.get('manager_lr', learning_rate)),
+            max_tasks=int(sm_base_cfg.get('max_tasks', 20)),
+            gamma=float(sm_base_cfg.get('gamma', 0.99)),
+            update_every=int(sm_base_cfg.get('update_every', 8)),
+            entropy_coef=float(sm_base_cfg.get('entropy_coef_manager', 0.01)),
+            device=_dev,
+            speed_function=speed_function,
+            log_metrics=True,
+            log_every=int(sm_base_cfg.get('train_log_every', max(1, training_steps // 200))),
+            metrics_dir='results/train_metrics',
+            metrics_tag='Softmax-HMARL',
+            n_envs=1,
+        )
 
     # 规则分配器（静态环境用；动态环境由实验侧分配或简单就地导航）
     # 动态环境使用对应的任务池分配器（S-Shape/Return/Optimal）
@@ -215,6 +228,15 @@ def evaluate_method(method_name: str,
         import torch as _torch
         nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
         _det_eval = bool(nl_cfg.get('deterministic_eval', False))
+        device = getattr(model, 'device', None)
+        if isinstance(device, str):
+            device = _torch.device(device)
+        if device is None:
+            try:
+                device = next(model.parameters()).device
+            except Exception:
+                device = _torch.device('cpu')
+
         def _assign_with_model(e):
             state_vec = get_global_state(e)
             task_feats = get_task_features(e, max_tasks=model.n_tasks, pending_only=True)
@@ -227,15 +249,15 @@ def evaluate_method(method_name: str,
                     nid = int(getattr(t, 'zone', 0))
                 except Exception:
                     nid = 0
-                nest_ids[i] = max(0, min(3, nid))
+                nest_ids[i] = max(0, min(3, nid)) * 2 + (1 if getattr(t, 'priority', 0.0) > 0.7 else 0)
                 mask[i] = (t.status == TaskStatus.PENDING)
             local_mask = mask.copy()
             free_ids = [i for i, p in enumerate(e.pickers) if getattr(p, 'current_task', None) is None and len(p.carrying_items) == 0]
             if not free_ids or not local_mask.any():
                 return 0
-            s = _torch.tensor(state_vec, dtype=_torch.float32).unsqueeze(0)
-            tf = _torch.tensor(task_feats, dtype=_torch.float32).unsqueeze(0)
-            nid = _torch.tensor(nest_ids, dtype=_torch.long).unsqueeze(0)
+            s = _torch.tensor(state_vec, dtype=_torch.float32, device=device).unsqueeze(0)
+            tf = _torch.tensor(task_feats, dtype=_torch.float32, device=device).unsqueeze(0)
+            nid = _torch.tensor(nest_ids, dtype=_torch.long, device=device).unsqueeze(0)
             assigned = 0
             for pid in free_ids:
                 # Capability-aware mask: regulars skip forklift-only tasks
@@ -252,11 +274,16 @@ def evaluate_method(method_name: str,
                     for ii, tt in enumerate(t_list):
                         if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and (not is_forklift):
                             comp_mask[ii] = False
+                        if comp_mask[ii]:
+                            slack = float(getattr(tt, 'deadline', float('inf')) - e.current_time)
+                            eta = float(e.estimate_completion_time(p, tt))
+                            if slack <= eta:
+                                comp_mask[ii] = False
                 except Exception:
                     pass
                 if not comp_mask.any():
                     continue
-                m = _torch.tensor(comp_mask, dtype=_torch.bool).unsqueeze(0)
+                m = _torch.tensor(comp_mask, dtype=_torch.bool, device=device).unsqueeze(0)
                 sel, _ = model.select_tasks(s, tf, nid, m, deterministic=_det_eval)
                 idx = int(sel.item())
                 if not local_mask[idx] or idx >= len(t_list):
@@ -271,6 +298,81 @@ def evaluate_method(method_name: str,
                 assigned += 1
             return assigned
         dynamic_assign = _assign_with_model
+    elif method_name in ('NL-HMARL', 'NLHMARL', 'NL_HMARL', 'Softmax', 'SOFTMAX') and model is not None:
+        # Assignment via manager; workers使用传统导航
+        from exp.obs import get_global_state, get_task_features
+        from env.dynamic_warehouse_env import TaskStatus, PickerType
+        import numpy as _np
+        import torch as _torch
+        nl_cfg = kwargs.get('nl_cfg', {}) if isinstance(kwargs.get('nl_cfg', {}), dict) else {}
+        _det_eval = bool(nl_cfg.get('deterministic_eval', False))
+
+        device = getattr(model, 'device', None)
+        if isinstance(device, str):
+            device = _torch.device(device)
+        if device is None:
+            try:
+                device = next(model.parameters()).device
+            except Exception:
+                device = _torch.device('cpu')
+
+        def _assign_with_manager_only(e):
+            state_vec = get_global_state(e)
+            task_feats = get_task_features(e, max_tasks=model.n_tasks, pending_only=True)
+            nest_ids = _np.full((model.n_tasks,), -1, dtype=_np.int64)
+            mask = _np.zeros((model.n_tasks,), dtype=_np.bool_)
+            t_list = [t for t in getattr(e, 'task_pool', []) if t.status == TaskStatus.PENDING][:model.n_tasks]
+            for i, t in enumerate(t_list):
+                try:
+                    nid = int(getattr(t, 'zone', 0))
+                except Exception:
+                    nid = 0
+                nest_ids[i] = max(0, min(3, nid)) * 2 + (1 if getattr(t, 'priority', 0.0) > 0.7 else 0)
+                mask[i] = (t.status == TaskStatus.PENDING)
+            local_mask = mask.copy()
+            free_ids = [i for i, p in enumerate(e.pickers) if getattr(p, 'current_task', None) is None and len(p.carrying_items) == 0]
+            if not free_ids or not local_mask.any():
+                return 0
+            s = _torch.tensor(state_vec, dtype=_torch.float32, device=device).unsqueeze(0)
+            tf = _torch.tensor(task_feats, dtype=_torch.float32, device=device).unsqueeze(0)
+            nid = _torch.tensor(nest_ids, dtype=_torch.long, device=device).unsqueeze(0)
+            assigned = 0
+            for pid in free_ids:
+                comp_mask = local_mask.copy()
+                try:
+                    p = e.pickers[pid]
+                    is_forklift = (getattr(p, 'type', None) == PickerType.FORKLIFT)
+                    for ii, tt in enumerate(t_list):
+                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and not is_forklift:
+                            comp_mask[ii] = False
+                        if comp_mask[ii]:
+                            slack = float(getattr(tt, 'deadline', float('inf')) - e.current_time)
+                            eta = float(e.estimate_completion_time(p, tt))
+                            if slack <= eta:
+                                comp_mask[ii] = False
+                except Exception:
+                    pass
+                if not comp_mask.any():
+                    continue
+                m = _torch.tensor(comp_mask, dtype=_torch.bool, device=device).unsqueeze(0)
+                if method_name in ('Softmax', 'SOFTMAX'):
+                    sel, _ = model.manager.select_task(s, tf, task_mask=m, deterministic=_det_eval)
+                else:
+                    sel, _ = model.manager.select_task(s, tf, nid, m, deterministic=_det_eval)
+                idx = int(sel.item())
+                if not local_mask[idx] or idx >= len(t_list):
+                    continue
+                t = t_list[idx]
+                if t.status != TaskStatus.PENDING:
+                    continue
+                t.status = TaskStatus.ASSIGNED
+                t.assigned_picker = pid
+                e.pickers[pid].current_task = t
+                local_mask[idx] = False
+                assigned += 1
+            return assigned
+
+        dynamic_assign = _assign_with_manager_only
     else:
         dynamic_assign = lambda e: assign_tasks_dynamic(e)
 
@@ -363,10 +465,18 @@ def evaluate_method(method_name: str,
             if is_learning and model is not None:
                 import torch as _torch
                 import numpy as _np
+                dev = getattr(model, 'device', None)
+                if isinstance(dev, str):
+                    dev = _torch.device(dev)
+                if dev is None:
+                    try:
+                        dev = next(model.parameters()).device
+                    except Exception:
+                        dev = _torch.device('cpu')
                 # DQN 观测：Guided 使用 include_global=True，Pure 使用 False
                 include_global = (method_name == 'DQN-Guided')
                 obs_batch = [get_agent_observation(env, p, include_global=include_global) for p in env.pickers]
-                obs_tensor = _torch.tensor(_np.vstack(obs_batch), dtype=_torch.float32)
+                obs_tensor = _torch.tensor(_np.vstack(obs_batch), dtype=_torch.float32, device=dev)
                 # 有效动作掩码（环境动作索引空间: 0..3移动,4=IDLE,5/6 拣投）
                 masks = _np.vstack([_np.array(get_valid_actions(env, p), dtype=_np.int32) for p in env.pickers])
                 with _torch.no_grad():
@@ -382,15 +492,23 @@ def evaluate_method(method_name: str,
                 # Use worker policy to act; sanitize invalid moves
                 import torch as _torch
                 import numpy as _np
+                dev = getattr(model, 'device', None)
+                if isinstance(dev, str):
+                    dev = _torch.device(dev)
+                if dev is None:
+                    try:
+                        dev = next(model.parameters()).device
+                    except Exception:
+                        dev = _torch.device('cpu')
                 obs_batch = [get_agent_observation(env, p, include_global=True) for p in env.pickers]
-                obs_tensor = _torch.tensor(_np.vstack(obs_batch), dtype=_torch.float32)
+                obs_tensor = _torch.tensor(_np.vstack(obs_batch), dtype=_torch.float32, device=dev)
                 with _torch.no_grad():
                     outs = model.workers(obs_tensor)
                     # Mask invalid actions (PICK/DROP only allowed when adjacent)
                     try:
                         from exp.actions import get_valid_actions as _gva
                         vm = _np.vstack([_np.array(_gva(env, p), dtype=_np.float32) for p in env.pickers])
-                        vm_t = _torch.tensor(vm, dtype=_torch.float32)
+                        vm_t = _torch.tensor(vm, dtype=_torch.float32, device=dev)
                         probs = _torch.clamp(outs['action_probs'], min=1e-8) * vm_t
                         sums = probs.sum(dim=1, keepdim=True).clamp(min=1e-8)
                         probs = probs / sums
@@ -423,15 +541,23 @@ def evaluate_method(method_name: str,
                 # Use Softmax worker policy to act; sanitize invalid moves
                 import torch as _torch
                 import numpy as _np
+                dev = getattr(model, 'device', None)
+                if isinstance(dev, str):
+                    dev = _torch.device(dev)
+                if dev is None:
+                    try:
+                        dev = next(model.parameters()).device
+                    except Exception:
+                        dev = _torch.device('cpu')
                 obs_batch = [get_agent_observation(env, p, include_global=True) for p in env.pickers]
-                obs_tensor = _torch.tensor(_np.vstack(obs_batch), dtype=_torch.float32)
+                obs_tensor = _torch.tensor(_np.vstack(obs_batch), dtype=_torch.float32, device=dev)
                 with _torch.no_grad():
                     outs = model.workers(obs_tensor)
                     # Mask invalid actions (PICK/DROP only allowed when adjacent)
                     try:
                         from exp.actions import get_valid_actions as _gva
                         vm = _np.vstack([_np.array(_gva(env, p), dtype=_np.float32) for p in env.pickers])
-                        vm_t = _torch.tensor(vm, dtype=_torch.float32)
+                        vm_t = _torch.tensor(vm, dtype=_torch.float32, device=dev)
                         probs = _torch.clamp(outs['action_probs'], min=1e-8) * vm_t
                         sums = probs.sum(dim=1, keepdim=True).clamp(min=1e-8)
                         probs = probs / sums
@@ -700,14 +826,16 @@ def evaluate_method(method_name: str,
     # 汇总：仅保留 value 相关列（原始、衰减、总计）
     total_raw_value = int(sum(m.get('raw_value_completed', 0) for m in all_episode_metrics))
     total_decayed_value = int(sum(m.get('decayed_value_completed', 0) for m in all_episode_metrics))
-    total_value = int(sum(m.get('value_completed', 0) for m in all_episode_metrics))  # 包含销毁罚没
     total_penalty = int(sum(m.get('penalty_cum', 0) for m in all_episode_metrics))
+    total_value = total_decayed_value - total_penalty  # 净收益（衰减价值 - penalty）
+    total_orders_completed = int(sum(m.get('orders_completed', 0) for m in all_episode_metrics))
     results = {
         'method': method_name,
         'raw_value': total_raw_value,
         'decayed_value': total_decayed_value,
         'total_value': total_value,
         'penalty': total_penalty,
+        'tasks_completed': total_orders_completed,
     }
     return results
 

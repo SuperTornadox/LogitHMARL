@@ -132,7 +132,7 @@ def get_task_features(env, max_tasks=20, pending_only: bool = True):
     """将任务池编码成固定维度特征。
 
     - pending_only=True 时，仅取 PENDING 任务；否则按池顺序截取前 max_tasks 个。
-    - 输出 shape = [max_tasks, 5]，不足用零填充。
+    - 输出 shape = [max_tasks, 12]，不足用零填充。（IMPROVED: 从9维扩展到12维）
     """
     feats = []
     if pending_only:
@@ -166,13 +166,51 @@ def get_task_features(env, max_tasks=20, pending_only: bool = True):
             dist_norm = float(d_min) / max(1.0, float(env.width + env.height))
         except Exception:
             dist_norm = 0.0
+        try:
+            base_val = float(getattr(t, 'base_value', 0.0))
+        except Exception:
+            base_val = 0.0
+        try:
+            dec_val = float(env.get_task_decayed_value(t, at_time=env.current_time))
+        except Exception:
+            dec_val = base_val
+        time_to_deadline = max(0.0, float(getattr(t, 'deadline', 0.0) - env.current_time))
+        density = dec_val / max(1e-3, time_to_deadline) if time_to_deadline > 0 else dec_val
+
+        # IMPROVED: Add zone and urgency features for better nest separation
+        try:
+            zone_id = float(getattr(t, 'zone', 0))
+        except Exception:
+            zone_id = 0.0
+        is_urgent = 1.0 if (t.priority > 0.7 or time_to_deadline < 0.15) else 0.0
+
+        # IMPROVED: Add zone congestion feature
+        try:
+            zone_loads = [0] * 4
+            for p in env.pickers:
+                zx = int(p.x / max(1, env.width / 2))
+                zy = int(p.y / max(1, env.height / 2))
+                z_idx = zy * 2 + zx
+                if 0 <= z_idx < 4:
+                    zone_loads[z_idx] += 1
+            task_zone = int(zone_id) if 0 <= int(zone_id) < 4 else 0
+            zone_congestion = float(zone_loads[task_zone]) / max(1.0, float(env.n_pickers))
+        except Exception:
+            zone_congestion = 0.0
+
         feats.append([
             shx, shy,
             float(req_car),
+            base_val,
+            dec_val,
             t.priority,
-            max(0.0, t.deadline - env.current_time),
+            time_to_deadline,
             dist_norm,
+            density,
+            zone_id,           # NEW: zone (0-3)
+            is_urgent,         # NEW: urgency indicator
+            zone_congestion,   # NEW: zone congestion (0-1)
         ])
     while len(feats) < max_tasks:
-        feats.append([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+        feats.append([0.0] * 12)  # IMPROVED: Updated from 9 to 12 dimensions
     return np.array(feats[:max_tasks], dtype=np.float32)

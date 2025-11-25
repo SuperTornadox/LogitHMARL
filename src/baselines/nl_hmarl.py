@@ -21,14 +21,14 @@ class NLManager(nn.Module):
                  hidden_dim: int = 256,
                  embed_dim: int = 128,
                  learn_eta: bool = False,
-                 eta_init: float = 1.0):
+                 eta_init: float = 1.0,
+                 task_feature_dim: int = 6):
         super().__init__()
         self.n_tasks = n_tasks
         self.n_nests = n_nests
         self.learn_eta = learn_eta
 
-        # Task embedding from 6 features
-        self.task_embedder = nn.Linear(6, embed_dim)
+        self.task_embedder = nn.Linear(task_feature_dim, embed_dim)
 
         # Utility MLP over [global_state, task_embed]
         self.task_utility_net = nn.Sequential(
@@ -51,7 +51,7 @@ class NLManager(nn.Module):
         return self.eta_buf
 
     def compute_task_utilities(self, state: torch.Tensor, task_features: torch.Tensor) -> torch.Tensor:
-        # task_features: [B, T, 5]
+        # task_features: [B, T, task_feature_dim]
         # state: [B, S]
         B, T, _ = task_features.shape
         task_embeds = self.task_embedder(task_features)  # [B, T, E]
@@ -68,7 +68,7 @@ class NLManager(nn.Module):
         """
         Args:
             state: [B, S]
-            task_features: [B, T, 5]
+            task_features: [B, T, task_feature_dim]
             nest_ids: [B, T] ints in [0, n_nests) or -1 for padded/masked
             task_mask: [B, T] bool mask where True=valid
         Returns:
@@ -77,6 +77,8 @@ class NLManager(nn.Module):
         B, T, _ = task_features.shape
         M = self.n_nests
         utils = self.compute_task_utilities(state, task_features)  # [B, T]
+        # Clip utilities to prevent numerical instability
+        utils = torch.clamp(utils, min=-10.0, max=10.0)
         if task_mask is not None:
             utils = utils.masked_fill(~task_mask, -1e9)
 
@@ -88,22 +90,26 @@ class NLManager(nn.Module):
             u = utils[b]  # [T]
             nid = nest_ids[b]  # [T]
             mask = task_mask[b] if task_mask is not None else torch.ones_like(u, dtype=torch.bool)
-            # Upper level (size-normalized):
-            # U_m = mval + eta_m * ( log( Σ_j exp((u_j - mval)/eta_m) ) - log(|N_m|) )
-            # This uses log-mean-exp to reduce pure count effects (many decoys),
-            # highlighting nest structure rather than nest size.
+            # Upper level (FIXED: standard LSE without size normalization):
+            # U_m = mval + eta_m * log(Σ_j exp((u_j - mval)/eta_m))
+            # This preserves task value differences and allows zones with more high-value tasks
+            # to naturally have higher utility.
             U_m = []
             for m in range(M):
-                eta_m = etas[m]
+                eta_m = torch.clamp(etas[m], min=1.0, max=3.0)  # Narrower range for numerical stability
                 idx = (nid == m) & mask
                 if idx.any():
                     vals = u[idx]
+                    # FIXED: Use raw utilities directly (no normalization)
+                    # This preserves the value differences between high/low value tasks
                     mval = torch.max(vals)
-                    lse_in = torch.log(torch.clamp(torch.sum(torch.exp((vals - mval) / eta_m)), min=1e-12))
-                    count = torch.clamp(idx.float().sum(), min=1.0)
-                    lse_mean = lse_in - torch.log(count)
-                    # mval + eta*log-mean-exp((v-mval)/eta)
-                    U_m.append(mval + eta_m * lse_mean)
+                    exp_vals = torch.exp(torch.clamp((vals - mval) / eta_m, min=-20.0, max=20.0))
+                    lse = torch.log(torch.clamp(exp_vals.sum(), min=1e-12))
+                    # FIXED: Remove size normalization to avoid penalizing zones with many tasks
+                    # count = torch.clamp(idx.float().sum(), min=1.0)
+                    # lse_mean = lse - torch.log(count)
+                    # Use standard LogSumExp: allows zones with more high-value tasks to be preferred
+                    U_m.append(mval + eta_m * lse)
                 else:
                     U_m.append(torch.tensor(-1e9, device=u.device))
             U = torch.stack(U_m)  # [M]
@@ -114,15 +120,16 @@ class NLManager(nn.Module):
             for m in range(M):
                 idx = (nid == m) & mask
                 if idx.any():
-                    eta_m = etas[m]
+                    eta_m = torch.clamp(etas[m], min=1.0, max=3.0)  # Narrower range for numerical stability
                     vals = u[idx]
                     mval = torch.max(vals)
-                    exps = torch.exp((vals - mval) / eta_m)
+                    # Clip exponentials to prevent overflow
+                    exps = torch.exp(torch.clamp((vals - mval) / eta_m, min=-20.0, max=20.0))
                     denom = torch.clamp(exps.sum(), min=1e-12)
                     p_in = exps / denom
                     p_task[idx] = p_nest[m] * p_in
             # If all tasks masked, fall back to uniform over masked ones
-            if mask.any() and float(p_task.sum()) <= 1e-12:
+            if mask.any() and float(p_task.sum().detach()) <= 1e-12:
                 p_task[mask] = 1.0 / mask.float().sum()
             task_probs.append(p_task)
             nest_probs.append(p_nest)
@@ -180,7 +187,8 @@ class NLHMARL(nn.Module):
                  hidden_dim: int = 256,
                  device: str = 'cpu',
                  learn_eta: bool = False,
-                 eta_init: float = 1.0):
+                 eta_init: float = 1.0,
+                 task_feature_dim: int = 6):
         super().__init__()
         import torch
         from models.worker_policy import MultiAgentWorkerPolicy
@@ -198,6 +206,7 @@ class NLHMARL(nn.Module):
             embed_dim=128,
             learn_eta=learn_eta,
             eta_init=eta_init,
+            task_feature_dim=task_feature_dim,
         ).to(self.device)
 
         # Shared workers
@@ -238,7 +247,7 @@ class NLHMARL(nn.Module):
 
     def compute_manager_loss(self,
                              states: torch.Tensor,           # [N,S]
-                             task_features: torch.Tensor,    # [N,T,5]
+                             task_features: torch.Tensor,    # [N,T,task_feature_dim]
                              nest_ids: torch.Tensor,         # [N,T]
                              selected_tasks: torch.Tensor,   # [N]
                              advantages: torch.Tensor,       # [N]
@@ -250,7 +259,8 @@ class NLHMARL(nn.Module):
         log_probs = torch.log(probs)
         sel_logp = log_probs.gather(1, selected_tasks.unsqueeze(1)).squeeze(1)
         policy_loss = -(advantages * sel_logp).mean()
-        value_loss = F.mse_loss(outs['value'], returns)
+        # FIXED: Use Huber loss instead of MSE for stability
+        value_loss = F.huber_loss(outs['value'], returns, delta=10.0)
         # Entropy of task distribution
         ent = -(probs * torch.log(probs)).sum(dim=1)
         entropy_loss = -entropy_coef * ent.mean()

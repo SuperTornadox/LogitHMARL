@@ -10,7 +10,8 @@ class SoftmaxManager(nn.Module):
                  state_dim: int,
                  n_tasks: int,
                  hidden_dim: int = 256,
-                 embed_dim: int = 128):
+                 embed_dim: int = 128,
+                 task_feature_dim: int = 6):
         super().__init__()
         
         self.n_tasks = n_tasks
@@ -24,8 +25,8 @@ class SoftmaxManager(nn.Module):
             nn.Linear(hidden_dim, 1)
         )
         
-        # Task embedding network（6维任务特征）
-        self.task_embedder = nn.Linear(6, embed_dim)
+        # Task embedding network
+        self.task_embedder = nn.Linear(task_feature_dim, embed_dim)
         
         # Global encoder
         self.global_encoder = nn.Sequential(
@@ -120,7 +121,8 @@ class SoftmaxHMARL:
                  worker_obs_dim: int,
                  worker_action_dim: int,
                  hidden_dim: int = 256,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 task_feature_dim: int = 6):
         
         self.device = torch.device(device)
         self.n_agents = n_agents
@@ -130,7 +132,9 @@ class SoftmaxHMARL:
         self.manager = SoftmaxManager(
             state_dim=state_dim,
             n_tasks=n_tasks,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            embed_dim=128,
+            task_feature_dim=task_feature_dim
         ).to(self.device)
         
         # Workers (same as NL-HMARL)
@@ -201,9 +205,9 @@ class SoftmaxHMARL:
         log_probs = torch.log(outputs['task_probs'] + 1e-8)
         selected_log_probs = log_probs.gather(1, selected_tasks.unsqueeze(1)).squeeze(1)
         policy_loss = -(advantages * selected_log_probs).mean()
-        
-        # Value loss
-        value_loss = F.mse_loss(outputs['value'], returns)
+
+        # Value loss - FIXED: Use Huber loss for stability
+        value_loss = F.huber_loss(outputs['value'], returns, delta=10.0)
         
         # Entropy regularization
         entropy = self.manager.compute_entropy(outputs['task_probs'])

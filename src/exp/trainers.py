@@ -9,6 +9,72 @@ from exp.actions import get_valid_actions, convert_to_dynamic_actions
 from exp.assigners import assign_tasks_dynamic
 from exp.obs import get_global_state, get_task_features
 
+# Soft deadline filtering hyper-parameters (hours)
+SOFT_DEADLINE_RATIO = 1.15
+SOFT_DEADLINE_MIN_SLACK = 0.05
+
+
+def _apply_soft_deadline_filter(env, picker, task_list, mask,
+                                ratio: float = SOFT_DEADLINE_RATIO,
+                                min_slack: float = SOFT_DEADLINE_MIN_SLACK):
+    """Filter tasks whose remaining slack is insufficient for the picker."""
+    if mask is None or not mask.any():
+        return mask
+
+
+def _compute_high_value_risk(env,
+                             task,
+                             slack_threshold: float = 0.2,
+                             value_threshold: float = 80.0,
+                             risk_coef: float = 0.5) -> float:
+    """估算高价值任务被忽视时的潜在损失（越紧迫越大）。"""
+    try:
+        slack = float(getattr(task, 'deadline', float('inf')) - env.current_time)
+    except Exception:
+        slack = float('inf')
+    if not np.isfinite(slack):
+        slack = float('inf')
+    try:
+        dec_val = float(env.get_task_decayed_value(task, at_time=env.current_time))
+    except Exception:
+        dec_val = float(getattr(task, 'base_value', 0.0))
+    if dec_val < value_threshold or slack >= slack_threshold:
+        return 0.0
+    urgency = 1.0 - max(0.0, slack) / max(slack_threshold, 1e-6)
+    reward_cfg = getattr(env, 'reward_config', {}) or {}
+    late_penalty = abs(float(reward_cfg.get('late_penalty', 0.0))) if isinstance(reward_cfg, dict) else 0.0
+    return risk_coef * (dec_val + late_penalty) * urgency
+    if picker is None:
+        return mask
+    eta_fn = getattr(env, 'estimate_completion_time', None)
+    if eta_fn is None:
+        return mask
+    filtered = mask.copy()
+    pruned = False
+    try:
+        for idx, task in enumerate(task_list):
+            if idx >= len(filtered):
+                break
+            if not filtered[idx]:
+                continue
+            slack = float(getattr(task, 'deadline', float('inf')) - env.current_time)
+            if slack <= 0.0:
+                filtered[idx] = False
+                pruned = True
+                continue
+            eta = float(eta_fn(picker, task))
+            if eta <= 0.0 or not np.isfinite(eta):
+                continue
+            threshold = max(min_slack, eta * ratio)
+            if slack < threshold:
+                filtered[idx] = False
+                pruned = True
+        if filtered.any():
+            return filtered
+        return mask
+    except Exception:
+        return mask
+
 
 def train_flat_dqn(
     width: int, height: int,
@@ -483,7 +549,7 @@ def train_nl_hmarl(
     update_every: int = 8,
     entropy_coef: float = 0.01,
     # NL manager structure
-    n_nests: int = 4,
+    n_nests: int = 8,
     learn_eta: bool = False,
     eta_init: float = 1.0,
     device: str = 'cpu',
@@ -500,7 +566,7 @@ def train_nl_hmarl(
     Notes:
     - Global state built via exp.obs.get_global_state
     - Task features via exp.obs.get_task_features (5-dim per task)
-    - Nests are task.zone (0..3)
+    - Nests are task.zone * 2 + urgency (0..7)
     - Manager reward uses sum of env step rewards (global) per decision step
     - Uses 1-step return: R = r + gamma * V(s') and advantage A = R - V(s)
     """
@@ -523,10 +589,11 @@ def train_nl_hmarl(
 
     # Dimensions
     state_dim = int(get_global_state(envs[0]).shape[0])
+    task_feat_dim = int(get_task_features(envs[0], max_tasks=max_tasks, pending_only=True).shape[1])
     worker_obs_dim = 45  # reuse agent obs with include_global=True
     worker_action_dim = 7
     n_agents = envs[0].n_pickers
-    n_nests = 4
+    n_nests = 8
 
     model = NLHMARL(
         state_dim=state_dim,
@@ -539,6 +606,7 @@ def train_nl_hmarl(
         device=device,
         learn_eta=learn_eta,
         eta_init=eta_init,
+        task_feature_dim=task_feat_dim,
     )
     optim = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr)
 
@@ -546,6 +614,11 @@ def train_nl_hmarl(
     steps_log, loss_log, reward_log = [], [], []
     pol_log, val_log, entL_log, ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL', ncols=100, disable=True)
+    value_coef = 2.0
+    penalty_coef = 1.0
+    risk_value_threshold = 80.0
+    risk_slack_threshold = 0.2  # 小于约12分钟视为高风险
+    risk_coef = 0.5
     for step in pbar:
         # === Vectorized pass across envs ===
         decisions_all = []
@@ -560,12 +633,23 @@ def train_nl_hmarl(
             mask = np.zeros((max_tasks,), dtype=np.bool_)
             pending_tasks = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
             for i, t in enumerate(pending_tasks):
-                # 以区域(zone: 0..3)作为巢标识
+                # 以 Zone * 2 + Urgency 作为巢标识 (8 nests)
                 try:
                     nid = int(getattr(t, 'zone', 0))
                 except Exception:
                     nid = 0
-                nest_ids[i] = max(0, min(3, nid))
+                nid = max(0, min(3, nid))
+
+                is_urgent = 0
+                try:
+                    # Urgency check: priority > 0.7 or close to deadline (< 0.15h approx 9 min)
+                    rem = t.deadline - env.current_time
+                    if t.priority > 0.7 or rem < 0.15:
+                        is_urgent = 1
+                except Exception:
+                    pass
+
+                nest_ids[i] = nid * 2 + is_urgent
                 mask[i] = (t.status == TaskStatus.PENDING)
             free_pids = [i for i, p in enumerate(env.pickers) if p.current_task is None and len(p.carrying_items) == 0]
             local_mask = mask.copy()
@@ -578,13 +662,18 @@ def train_nl_hmarl(
                 nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
                 # Capability-aware task mask per picker
                 comp_mask = local_mask.copy()
+                picker = None
                 try:
-                    p = env.pickers[pid]
-                    for ii, tt in enumerate(t_list):
-                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and p.type != PickerType.FORKLIFT:
-                            comp_mask[ii] = False
+                    picker = env.pickers[pid]
                 except Exception:
-                    pass
+                    picker = None
+                if picker is not None:
+                    for ii, tt in enumerate(pending_tasks):
+                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and picker.type != PickerType.FORKLIFT:
+                            comp_mask[ii] = False
+                    filtered_mask = _apply_soft_deadline_filter(env, picker, pending_tasks, comp_mask)
+                    if filtered_mask is not None:
+                        comp_mask = filtered_mask
                 if not comp_mask.any():
                     continue
                 m = torch.tensor(comp_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
@@ -626,25 +715,114 @@ def train_nl_hmarl(
                     else:
                         st = env.stations[t.station_id]
                         actions[i] = 4 if abs(p.x - st['x']) + abs(p.y - st['y']) == 1 else smart_navigate(p, (st['x'], st['y']), env)
-            # Manager 差分回报：仅关注“完成价值增量 − 迟到罚没增量”以降低噪声
+            # Manager 差分回报：仅关注"完成价值增量 − 迟到罚没增量"以降低噪声
             prev_val = float(getattr(env, 'total_value_completed', 0.0))
             prev_pen = float(getattr(env, 'total_value_penalty', 0.0))
+
+            # 记录执行前每个picker到目标的距离(用于进度奖励)
+            prev_distances = {}
+            for i, p in enumerate(env.pickers):
+                t = getattr(p, 'current_task', None)
+                if t is not None:
+                    if len(p.carrying_items) == 0 and t.shelf_id is not None and t.shelf_id < len(env.shelves):
+                        # 前往货架
+                        sh = env.shelves[t.shelf_id]
+                        prev_distances[p.id] = abs(p.x - sh['x']) + abs(p.y - sh['y'])
+                    elif len(p.carrying_items) > 0 and t.station_id is not None and t.station_id < len(env.stations):
+                        # 前往站点
+                        st = env.stations[t.station_id]
+                        prev_distances[p.id] = abs(p.x - st['x']) + abs(p.y - st['y'])
+
             env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
             _, _, _, _ = env.step(env_actions)
             val_now = float(getattr(env, 'total_value_completed', 0.0))
             pen_now = float(getattr(env, 'total_value_penalty', 0.0))
+
+            # 计算进度奖励：接近目标获得正奖励
+            progress_reward = 0.0
+            for i, p in enumerate(env.pickers):
+                if p.id in prev_distances:
+                    t = getattr(p, 'current_task', None)
+                    if t is not None:
+                        curr_dist = 0
+                        if len(p.carrying_items) == 0 and t.shelf_id is not None and t.shelf_id < len(env.shelves):
+                            sh = env.shelves[t.shelf_id]
+                            curr_dist = abs(p.x - sh['x']) + abs(p.y - sh['y'])
+                        elif len(p.carrying_items) > 0 and t.station_id is not None and t.station_id < len(env.stations):
+                            st = env.stations[t.station_id]
+                            curr_dist = abs(p.x - st['x']) + abs(p.y - st['y'])
+
+                        # 距离缩短 = 正奖励, 距离增加 = 负奖励
+                        distance_delta = prev_distances[p.id] - curr_dist
+                        progress_reward += distance_delta * 0.5  # 每缩短1格距离 = +0.5奖励
+
+            # 忽视高价值任务的风险惩罚：衡量仍未分配的【贵且快到期】任务
+            risk_penalty = 0.0
+            if pending_tasks:
+                for idx, keep in enumerate(local_mask):
+                    if not keep or idx >= len(pending_tasks):
+                        continue
+                    risk_penalty += _compute_high_value_risk(
+                        env,
+                        pending_tasks[idx],
+                        slack_threshold=risk_slack_threshold,
+                        value_threshold=risk_value_threshold,
+                        risk_coef=risk_coef
+                    )
+            
+            # 拥堵惩罚：计算每个Zone的负载 (Zone 0-3)
+            zone_loads = [0] * 4
+            for p in env.pickers:
+                # 将picker位置映射到Zone
+                zx = int(p.x / (env.width / 2))
+                zy = int(p.y / (env.height / 2))
+                z_idx = zy * 2 + zx
+                if 0 <= z_idx < 4:
+                    zone_loads[z_idx] += 1
+            
             # 差分回报并做幅度裁剪，稳定训练
-            manager_r = (val_now - prev_val) - (pen_now - prev_pen)
+            value_gain = (val_now - prev_val)
+            penalty_gain = (pen_now - prev_pen)
+            manager_r = value_coef * value_gain - penalty_coef * penalty_gain - risk_penalty + progress_reward
+            
+            # 为每个决策施加特定Zone的拥堵惩罚
+            # 如果分配的任务在拥堵区，给一个额外负反馈
+            congestion_penalty = 0.0
+            for d_idx, (_, _, nid_tensor, _, action_tensor) in enumerate(decisions):
+                try:
+                    # nid 是 nest_id (0-7), zone_id = nid // 2
+                    task_nest = nid_tensor.item() if nid_tensor.numel() == 1 else nid_tensor[0].item()
+                    task_zone = int(task_nest // 2)
+                    if 0 <= task_zone < 4:
+                        # 如果该区人数 > 3 (根据总人数15平均每区3.75)，则视为拥堵
+                        if zone_loads[task_zone] > 4:
+                             # 拥堵度线性惩罚: (load - 4) * 2.0
+                             congestion_penalty -= (zone_loads[task_zone] - 4) * 2.0
+                except Exception:
+                    pass
+            
+            # 将总拥堵惩罚平摊到当前步的 reward 中 (或者仅针对特定决策，但这里是全局共享reward)
+            # 为简单起见，将拥堵惩罚加到全局 manager_r，但这会惩罚所有决策
+            # 更好的做法是：让 Critic 学习到这种状态价值低。
+            # 这里我们直接加到 manager_r，作为全局指导信号。
+            if decisions:
+                manager_r += congestion_penalty / max(1, len(decisions))
+
             manager_r = float(np.clip(manager_r, -50.0, 50.0))
             manager_r_acc += manager_r
             if decisions:
                 next_state_vec = get_global_state(env)
                 with torch.no_grad():
                     v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0).item()
+                    # FIXED: Clip v_next to prevent value explosion
+                    v_next = float(np.clip(v_next, -100.0, 100.0))
                 r = torch.full((len(decisions),), manager_r, dtype=torch.float32, device=model.device)
+                # FIXED: Clip returns to prevent value explosion
+                returns_tensor = r + gamma * v_next
+                returns_tensor = torch.clamp(returns_tensor, -100.0, 100.0)
                 # Accumulate
                 decisions_all.extend(decisions)
-                returns_all.append(r + gamma * v_next)
+                returns_all.append(returns_tensor)
         # Single batched update across envs
         if len(decisions_all) > 0:
             batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
@@ -745,6 +923,18 @@ def train_nl_hmarl(
                 plt.close()
         except Exception as e:
             print(f"[warn] Failed to save NL-HMARL metrics: {e}")
+
+    # Save model checkpoint
+    if log_metrics:
+        try:
+            out_dir = os.path.join(metrics_dir or 'results/train_metrics', metrics_tag or 'NL-HMARL')
+            os.makedirs(out_dir, exist_ok=True)
+            checkpoint_path = os.path.join(out_dir, 'model_final.pth')
+            model.save(checkpoint_path)
+            print(f"✅ Model checkpoint saved to: {checkpoint_path}")
+        except Exception as e:
+            print(f"[warn] Failed to save model checkpoint: {e}")
+
     return model
 
 
@@ -757,7 +947,7 @@ def train_nl_hmarl_subproc(
     max_tasks: int = 20,
     gamma: float = 0.99,
     entropy_coef: float = 0.01,
-    n_nests: int = 4,
+    n_nests: int = 8,  # Changed from 4 to 8 for zone×urgency
     learn_eta: bool = False,
     eta_init: float = 1.0,
     device: str = 'cpu',
@@ -833,6 +1023,9 @@ def train_nl_hmarl_subproc(
                     for ii, tt in enumerate(pending_tasks):
                         if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and p.type != PickerType.FORKLIFT:
                             comp_mask[ii] = False
+                    filtered_mask = _apply_soft_deadline_filter(env, p, pending_tasks, comp_mask)
+                    if filtered_mask is not None:
+                        comp_mask = filtered_mask
                 except Exception:
                     pass
                 if not comp_mask.any():
@@ -856,7 +1049,12 @@ def train_nl_hmarl_subproc(
             nsv = np.array(out.get('next_state_vec'), dtype=np.float32)
             with torch.no_grad():
                 v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-            returns_all.append(torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next.item())
+                # FIXED: Clip v_next to prevent value explosion
+                v_next_val = float(np.clip(v_next.item(), -100.0, 100.0))
+            # FIXED: Clip returns to prevent value explosion
+            returns_tensor = torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next_val
+            returns_tensor = torch.clamp(returns_tensor, -100.0, 100.0)
+            returns_all.append(returns_tensor)
         # Update manager
         if len(decisions_all) > 0:
             batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
@@ -949,7 +1147,7 @@ def train_nl_hmarl_ac(
     entropy_coef_manager: float = 0.01,
     entropy_coef_workers: float = 0.01,
     # NL manager structure
-    n_nests: int = 4,
+    n_nests: int = 8,
     learn_eta: bool = False,
     eta_init: float = 1.0,
     device: str = 'cpu',
@@ -988,7 +1186,8 @@ def train_nl_hmarl_ac(
     worker_obs_dim = 45
     worker_action_dim = 7
     n_agents = envs[0].n_pickers
-    n_nests = 4
+    task_feat_dim = int(get_task_features(envs[0], max_tasks=max_tasks, pending_only=True).shape[1])
+    n_nests = 8
 
     model = NLHMARL(
         state_dim=state_dim,
@@ -1001,6 +1200,7 @@ def train_nl_hmarl_ac(
         device=device,
         learn_eta=learn_eta,
         eta_init=eta_init,
+        task_feature_dim=task_feat_dim,
     )
     opt_manager = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr_manager)
     opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
@@ -1008,6 +1208,11 @@ def train_nl_hmarl_ac(
     steps_log, m_loss_log, w_loss_log, reward_log = [], [], [], []
     m_pl_log, m_vl_log, m_entL_log, m_ent_log = [], [], [], []
     pbar = tqdm(range(training_steps), desc='Train NL-HMARL-AC', ncols=100, disable=True)
+    value_coef = 2.0
+    penalty_coef = 1.0
+    risk_value_threshold = 80.0
+    risk_slack_threshold = 0.2
+    risk_coef = 0.5
 
     for step in pbar:
         # Accumulators across envs
@@ -1025,12 +1230,23 @@ def train_nl_hmarl_ac(
             mask = np.zeros((max_tasks,), dtype=np.bool_)
             t_list = [t for t in env.task_pool if t.status == TaskStatus.PENDING][:max_tasks]
             for i, t in enumerate(t_list):
-                # 以区域(zone: 0..3)作为巢标识
+                # 以 Zone * 2 + Urgency 作为巢标识 (8 nests)
                 try:
                     nid = int(getattr(t, 'zone', 0))
                 except Exception:
                     nid = 0
-                nest_ids[i] = max(0, min(3, nid))
+                nid = max(0, min(3, nid))
+
+                is_urgent = 0
+                try:
+                    # Urgency check: priority > 0.7 or close to deadline (< 0.15h approx 9 min)
+                    rem = t.deadline - env.current_time
+                    if t.priority > 0.7 or rem < 0.15:
+                        is_urgent = 1
+                except Exception:
+                    pass
+
+                nest_ids[i] = nid * 2 + is_urgent
                 mask[i] = (t.status == TaskStatus.PENDING)
             free_pids = [i for i, p in enumerate(env.pickers) if p.current_task is None and len(p.carrying_items) == 0]
             local_mask = mask.copy()
@@ -1041,7 +1257,22 @@ def train_nl_hmarl_ac(
                 s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
                 tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
                 nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-                m = torch.tensor(local_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
+                comp_mask = local_mask.copy()
+                picker = None
+                try:
+                    picker = env.pickers[pid]
+                except Exception:
+                    picker = None
+                if picker is not None:
+                    for ii, tt in enumerate(t_list):
+                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and picker.type != PickerType.FORKLIFT:
+                            comp_mask[ii] = False
+                    filtered_mask = _apply_soft_deadline_filter(env, picker, t_list, comp_mask)
+                    if filtered_mask is not None:
+                        comp_mask = filtered_mask
+                if not comp_mask.any():
+                    continue
+                m = torch.tensor(comp_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
                 with torch.no_grad():
                     sel, _ = model.select_tasks(s, tf, nid, m, deterministic=False)
                 idx = int(sel.item())
@@ -1092,23 +1323,84 @@ def train_nl_hmarl_ac(
                         else:
                             a = 4
                 actions[i] = a
-            # Manager 差分回报：完成价值 − 迟到罚没的增量
+            # Manager 差分回报：完成价值 − 迟到罚没的增量 + 任务完成数奖励
             prev_val = float(getattr(env, 'total_value_completed', 0.0))
             prev_pen = float(getattr(env, 'total_value_penalty', 0.0))
+            prev_tasks_done = int(getattr(env, 'tasks_completed', 0))
             env_actions = convert_to_dynamic_actions(actions, env, input_space='env')
             _, rewards, dones, _ = env.step(env_actions)
             val_now = float(getattr(env, 'total_value_completed', 0.0))
             pen_now = float(getattr(env, 'total_value_penalty', 0.0))
-            manager_r = (val_now - prev_val) - (pen_now - prev_pen)
-            manager_r = float(np.clip(manager_r, -50.0, 50.0))
+            tasks_done_now = int(getattr(env, 'tasks_completed', 0))
+
+            risk_penalty = 0.0
+            if t_list:
+                for idx, keep in enumerate(local_mask):
+                    if not keep or idx >= len(t_list):
+                        continue
+                    risk_penalty += _compute_high_value_risk(
+                        env,
+                        t_list[idx],
+                        slack_threshold=risk_slack_threshold,
+                        value_threshold=risk_value_threshold,
+                        risk_coef=risk_coef
+                    )
+            
+            # 拥堵惩罚 (AC版)
+            zone_loads = [0] * 4
+            for p in env.pickers:
+                zx = int(p.x / (env.width / 2))
+                zy = int(p.y / (env.height / 2))
+                z_idx = zy * 2 + zx
+                if 0 <= z_idx < 4:
+                    zone_loads[z_idx] += 1
+            
+            congestion_penalty = 0.0
+            for d_idx, (_, _, nid_tensor, _, action_tensor) in enumerate(decisions):
+                try:
+                    task_nest = nid_tensor.item() if nid_tensor.numel() == 1 else nid_tensor[0].item()
+                    task_zone = int(task_nest // 2)
+                    if 0 <= task_zone < 4:
+                        if zone_loads[task_zone] > 4:
+                             congestion_penalty -= (zone_loads[task_zone] - 4) * 2.0
+                except Exception:
+                    pass
+
+            value_gain = (val_now - prev_val)
+            penalty_gain = (pen_now - prev_pen)
+            tasks_gain = (tasks_done_now - prev_tasks_done)
+
+            # Enhanced manager reward (BALANCED):
+            # - Moderate boost on value (2.5 vs 2.0)
+            # - Balanced bonus for completing tasks (+3 per task, not +10)
+            # - Reduced risk penalty weight (0.5 vs 1.0)
+            # - Small time efficiency bonus
+            task_completion_bonus = tasks_gain * 3.0  # FIXED: Reduced from 10.0
+            time_efficiency_bonus = 0.0
+            if decisions:
+                # Reward assigning tasks to more agents (encourages parallelism)
+                time_efficiency_bonus = len(decisions) * 0.2  # FIXED: Reduced from 0.5
+
+            manager_r = (2.5 * value_gain - 0.9 * penalty_gain +
+                        task_completion_bonus + time_efficiency_bonus -
+                        0.5 * risk_penalty)
+            if decisions:
+                manager_r += congestion_penalty / max(1, len(decisions))
+
+            manager_r = float(np.clip(manager_r, -50.0, 50.0))  # FIXED: Tighter clip
             # Accumulate buffers for batched updates
             if decisions:
                 next_state_vec = get_global_state(env)
                 with torch.no_grad():
                     v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0).item()
+                    # FIXED: Clip v_next to prevent explosion
+                    v_next = float(np.clip(v_next, -100.0, 100.0))
                 r = torch.full((len(decisions),), manager_r, dtype=torch.float32, device=model.device)
+                returns_tensor = r + gamma * v_next
+                # FIXED: Clip returns to prevent value explosion
+                returns_tensor = torch.clamp(returns_tensor, -100.0, 100.0)
                 decisions_all.extend(decisions)
-                returns_all.append(r + gamma * v_next)
+                returns_all.append(returns_tensor)
             obs_all.append(obs_tensor)
             actions_all.append(torch.tensor([actions[i] for i in range(n_agents)], dtype=torch.long, device=model.device))
             # Reward/done vectors for worker A2C
@@ -1170,9 +1462,12 @@ def train_nl_hmarl_ac(
             r_vec = torch.cat(rewards_all, dim=0)
             d_vec = torch.cat(dones_all, dim=0)
             returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+            # Clip returns to prevent value explosion
+            returns_w = torch.clamp(returns_w, -100.0, 100.0)
             adv_w = returns_w - out2['value']
             policy_loss = -(adv_w.detach() * act_logp).mean()
-            value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+            # Use Huber loss instead of MSE for robustness against outliers
+            value_loss = torch.nn.functional.huber_loss(out2['value'], returns_w.detach(), delta=10.0)
             entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
             total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
             opt_workers.zero_grad(); total_w_loss.backward()
@@ -1182,9 +1477,12 @@ def train_nl_hmarl_ac(
         else:
             cur_w_loss = float('nan')
 
-        # 平均 manager 差分回报（用于日志）
+        # 平均即时奖励（用于日志）
         try:
-            step_rew = float(np.mean([float(getattr(env, 'total_value_completed', 0.0)) for env in envs]))  # placeholder
+            if rewards_all:
+                step_rew = float(np.mean([float(r.mean().item() if hasattr(r, 'item') else r.mean()) for r in rewards_all]))
+            else:
+                step_rew = 0.0
         except Exception:
             step_rew = 0.0
         # 6) Logging (buffer only; write CSV/PNG after training)
@@ -1296,6 +1594,7 @@ def train_softmax_hmarl(
     worker_obs_dim = 45
     worker_action_dim = 7
     n_agents = envs[0].n_pickers
+    task_feat_dim = int(get_task_features(envs[0], max_tasks=max_tasks, pending_only=True).shape[1])
 
     model = SoftmaxHMARL(
         state_dim=state_dim,
@@ -1305,6 +1604,7 @@ def train_softmax_hmarl(
         worker_action_dim=worker_action_dim,
         hidden_dim=hidden_dim,
         device=device,
+        task_feature_dim=task_feat_dim,
     )
     optim = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr)
 
@@ -1336,15 +1636,20 @@ def train_softmax_hmarl(
                 s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
                 tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
                 nid = torch.tensor(nest_ids, dtype=torch.long, device=model.device).unsqueeze(0)
-                # Capability-aware mask per picker: regulars skip forklift-only tasks
+                # Capability-aware mask per picker + deadline过滤
                 comp_mask = local_mask.copy()
+                picker = None
                 try:
-                    p = env.pickers[pid]
+                    picker = env.pickers[pid]
                     for ii, tt in enumerate(pending_tasks):
-                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and p.type != PickerType.FORKLIFT:
+                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and picker.type != PickerType.FORKLIFT:
                             comp_mask[ii] = False
                 except Exception:
-                    pass
+                    picker = None
+                if picker is not None:
+                    filtered_mask = _apply_soft_deadline_filter(env, picker, pending_tasks, comp_mask)
+                    if filtered_mask is not None:
+                        comp_mask = filtered_mask
                 if not comp_mask.any():
                     continue
                 m = torch.tensor(comp_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
@@ -1397,8 +1702,13 @@ def train_softmax_hmarl(
                 next_state_vec = get_global_state(env)
                 with torch.no_grad():
                     v_next = model.value_net(torch.tensor(next_state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0).item()
+                    # FIXED: Clip v_next to prevent value explosion
+                    v_next = float(np.clip(v_next, -100.0, 100.0))
                 r = torch.full((len(decisions_all),), step_reward, dtype=torch.float32, device=model.device)
-                returns_all.append(r + gamma * v_next)
+                # FIXED: Clip returns to prevent value explosion
+                returns_tensor = r + gamma * v_next
+                returns_tensor = torch.clamp(returns_tensor, -100.0, 100.0)
+                returns_all.append(returns_tensor)
         # Single batch update
         if len(decisions_all) > 0 and len(returns_all) > 0:
             states = torch.cat([d[0] for d in decisions_all], dim=0)
@@ -1460,6 +1770,18 @@ def train_softmax_hmarl(
             df.to_csv(os.path.join(out_dir, 'metrics.csv'), index=False)
         except Exception:
             pass
+
+    # Save model checkpoint
+    if log_metrics:
+        try:
+            out_dir = os.path.join(metrics_dir or 'results/train_metrics', metrics_tag or 'Softmax-HMARL')
+            os.makedirs(out_dir, exist_ok=True)
+            checkpoint_path = os.path.join(out_dir, 'model_final.pth')
+            model.save(checkpoint_path)
+            print(f"✅ Model checkpoint saved to: {checkpoint_path}")
+        except Exception as e:
+            print(f"[warn] Failed to save model checkpoint: {e}")
+
     return model
 
 
@@ -1505,6 +1827,7 @@ def train_softmax_hmarl_ac(
         ev.reset()
 
     state_dim = int(get_global_state(envs[0]).shape[0])
+    task_feat_dim = int(get_task_features(envs[0], max_tasks=max_tasks, pending_only=True).shape[1])
     worker_obs_dim = 45
     worker_action_dim = 7
     n_agents = envs[0].n_pickers
@@ -1517,6 +1840,7 @@ def train_softmax_hmarl_ac(
         worker_action_dim=worker_action_dim,
         hidden_dim=hidden_dim,
         device=device,
+        task_feature_dim=task_feat_dim,
     )
     opt_manager = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr_manager)
     opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
@@ -1548,15 +1872,20 @@ def train_softmax_hmarl_ac(
                     break
                 s = torch.tensor(state_vec, dtype=torch.float32, device=model.device).unsqueeze(0)
                 tf = torch.tensor(task_feats, dtype=torch.float32, device=model.device).unsqueeze(0)
-                # capability-aware mask per picker
+                # capability-aware mask per picker + deadline过滤
                 comp_mask = local_mask.copy()
+                picker = None
                 try:
-                    p = env.pickers[pid]
+                    picker = env.pickers[pid]
                     for ii, tt in enumerate(t_list):
-                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and p.type != PickerType.FORKLIFT:
+                        if comp_mask[ii] and bool(getattr(tt, 'requires_car', False)) and picker.type != PickerType.FORKLIFT:
                             comp_mask[ii] = False
                 except Exception:
-                    pass
+                    picker = None
+                if picker is not None:
+                    filtered_mask = _apply_soft_deadline_filter(env, picker, t_list, comp_mask)
+                    if filtered_mask is not None:
+                        comp_mask = filtered_mask
                 if not comp_mask.any():
                     continue
                 m = torch.tensor(comp_mask, dtype=torch.bool, device=model.device).unsqueeze(0)
@@ -1605,7 +1934,12 @@ def train_softmax_hmarl_ac(
                 nsv = get_global_state(env)
                 with torch.no_grad():
                     v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-                returns_all.append(torch.full((len(decisions_all),), step_rew, dtype=torch.float32, device=model.device) + gamma * v_next.item())
+                    # FIXED: Clip v_next to prevent value explosion
+                    v_next_val = float(np.clip(v_next.item(), -100.0, 100.0))
+                # FIXED: Clip returns to prevent value explosion
+                returns_tensor = torch.full((len(decisions_all),), step_rew, dtype=torch.float32, device=model.device) + gamma * v_next_val
+                returns_tensor = torch.clamp(returns_tensor, -100.0, 100.0)
+                returns_all.append(returns_tensor)
         # Manager update
         if len(decisions_all) > 0 and len(returns_all) > 0:
             states = torch.cat([d[0] for d in decisions_all], dim=0)
@@ -1648,9 +1982,12 @@ def train_softmax_hmarl_ac(
             r_vec = torch.cat(rewards_all, dim=0)
             d_vec = torch.cat(dones_all, dim=0)
             returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+            # Clip returns to prevent value explosion
+            returns_w = torch.clamp(returns_w, -100.0, 100.0)
             adv_w = returns_w - out2['value']
             policy_loss = -(adv_w.detach() * act_logp).mean()
-            value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+            # Use Huber loss instead of MSE for robustness against outliers
+            value_loss = torch.nn.functional.huber_loss(out2['value'], returns_w.detach(), delta=10.0)
             entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
             total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
             opt_workers.zero_grad(); total_w_loss.backward()
@@ -1754,6 +2091,7 @@ def train_nl_hmarl_ac_subproc(
         device=device,
         learn_eta=learn_eta,
         eta_init=eta_init,
+        task_feature_dim=task_feat_dim,
     )
     opt_manager = torch.optim.Adam(list(model.manager.parameters()) + list(model.value_net.parameters()), lr=lr_manager)
     opt_workers = torch.optim.Adam(model.workers.parameters(), lr=lr_workers)
@@ -1822,7 +2160,12 @@ def train_nl_hmarl_ac_subproc(
             nsv = np.array(out.get('next_state_vec'), dtype=np.float32)
             with torch.no_grad():
                 v_next = model.value_net(torch.tensor(nsv, dtype=torch.float32, device=model.device).unsqueeze(0)).squeeze(0)
-            returns_all.append(torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next.item())
+                # FIXED: Clip v_next to prevent value explosion
+                v_next_val = float(np.clip(v_next.item(), -100.0, 100.0))
+            # FIXED: Clip returns to prevent value explosion
+            returns_tensor = torch.full((len(per_env_decisions[ei]),), r, dtype=torch.float32, device=model.device) + gamma * v_next_val
+            returns_tensor = torch.clamp(returns_tensor, -100.0, 100.0)
+            returns_all.append(returns_tensor)
         if len(decisions_all) > 0:
             batch_states = torch.cat([d[0] for d in decisions_all], dim=0)
             batch_tf = torch.cat([d[1] for d in decisions_all], dim=0)
@@ -1833,6 +2176,12 @@ def train_nl_hmarl_ac_subproc(
             with torch.no_grad():
                 v = model.value_net(batch_states).squeeze(-1)
             adv = returns - v
+            # 优势标准化（无偏差修正，避免N=1产生NaN）；若std过小则仅去均值
+            std = adv.std(unbiased=False)
+            if torch.isfinite(std) and float(std.item()) > 1e-8:
+                adv = (adv - adv.mean()) / (std + 1e-8)
+            else:
+                adv = adv - adv.mean()
             loss_dict = model.compute_manager_loss(batch_states, batch_tf, batch_nid, batch_idx, adv, returns,
                                                    task_mask=batch_mask, entropy_coef=entropy_coef_manager)
             opt_manager.zero_grad(); loss_dict['total_loss'].backward()
@@ -1866,9 +2215,18 @@ def train_nl_hmarl_ac_subproc(
             r_vec = torch.cat(rewards_all, dim=0)
             d_vec = torch.cat(dones_all, dim=0)
             returns_w = r_vec + gamma * next_vals * (1.0 - d_vec)
+            # Clip returns to prevent value explosion
+            returns_w = torch.clamp(returns_w, -100.0, 100.0)
             adv_w = returns_w - out2['value']
+            # 优势标准化（无偏差修正，避免N=1产生NaN）；若std过小则仅去均值
+            std_w = adv_w.std(unbiased=False)
+            if torch.isfinite(std_w) and float(std_w.item()) > 1e-8:
+                adv_w = (adv_w - adv_w.mean()) / (std_w + 1e-8)
+            else:
+                adv_w = adv_w - adv_w.mean()
             policy_loss = -(adv_w.detach() * act_logp).mean()
-            value_loss = torch.nn.functional.mse_loss(out2['value'], returns_w.detach())
+            # Use Huber loss instead of MSE for robustness against outliers
+            value_loss = torch.nn.functional.huber_loss(out2['value'], returns_w.detach(), delta=10.0)
             entropy = -(out2['action_probs'] * torch.log(torch.clamp(out2['action_probs'], min=1e-8))).sum(dim=1).mean()
             total_w_loss = policy_loss + value_loss - entropy_coef_workers * entropy
             opt_workers.zero_grad(); total_w_loss.backward()

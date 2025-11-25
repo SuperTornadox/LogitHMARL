@@ -113,6 +113,7 @@ class Task:
     start_time: Optional[float] = None
     completion_time: Optional[float] = None
     base_value: int = 0            # 任务基础价值（value*quantity），用于衰减与罚没
+    assigned_time: Optional[float] = None
 
 @dataclass
 class Picker:
@@ -137,6 +138,9 @@ class Picker:
         # 连续位置（用于可视化平滑移动）
         self.fx = float(x)
         self.fy = float(y)
+        # 进度追踪（用于卡死检测）
+        self.last_progress_step = 0
+        self._tracked_task_id: Optional[int] = None
 
 class DynamicWarehouseEnv:
     """三维仓储 + 多类型订单 + 双代理类型 的动态环境实现
@@ -182,6 +186,9 @@ class DynamicWarehouseEnv:
         # VARIANT-1: 超容量时的严厉惩罚（指数级）
         self.zone_overcapacity_penalty = config.get('zone_overcapacity_penalty', -10.0)
         self.zone_overcapacity_speed_mult = config.get('zone_overcapacity_speed_mult', 0.1)  # 速度降至10%
+        # 卡死检测：超过指定步数无进展则自动释放任务
+        self.stuck_release_steps = int(config.get('stuck_release_steps', 80))
+        self.stuck_release_penalty = float(config.get('stuck_release_penalty', 0.0))
         # 重量阈值（用于分类）。
         # - < medium → light
         # - [medium, heavy) → medium
@@ -222,22 +229,29 @@ class DynamicWarehouseEnv:
         self.order_generator = NonHomogeneousPoissonOrderGenerator(order_config)
 
         # 奖励配置（按重量与代理类型调节效率）
+        # REWARD SHAPING V3: 加入任务价值奖励 - 鼓励选择高价值任务
         self.reward_config = {
-            'idle_penalty': -0.05,
-            'move_toward_target': 0.1,
-            'congestion_penalty': -0.5,
-            'battery_low_penalty': -1.0,
-            'on_time_bonus': 5.0,
-            'late_penalty': -5.0,
-            # 按重量分配PICK/DROP基础奖励
-            'pick_base': {'forklift_only': 4.0, 'heavy': 3.0, 'medium': 2.0, 'light': 1.0},
-            'drop_base': {'forklift_only': 5.0, 'heavy': 4.0, 'medium': 2.5, 'light': 1.5},
+            'idle_penalty': -0.002,           # ← 进一步减少 (原 -0.005)
+            'move_toward_target': 1.0,        # ← 翻倍 (原 0.5) - 强烈鼓励接近目标
+            'congestion_penalty': -0.05,      # ← 进一步减少 (原 -0.1)
+            'battery_low_penalty': -0.1,      # ← 进一步减少 (原 -0.3)
+            'on_time_bonus': 30.0,            # ← 翻倍! (原 15.0) - 核心奖励
+            'late_penalty': -1.0,             # ← 进一步减少 (原 -2.0) - 最小惩罚
+            # 按重量分配PICK/DROP基础奖励 - 再增加50%
+            'pick_base': {'forklift_only': 12.0, 'heavy': 9.0, 'medium': 6.0, 'light': 4.5},  # ← +50%
+            'drop_base': {'forklift_only': 15.0, 'heavy': 12.0, 'medium': 7.5, 'light': 4.5}, # ← +50%
+            # 成功完成 drop 的额外吞吐奖励
+            'drop_completion_bonus': 8.0,     # ← 大幅增加 (原 5.0)
             # 车辆型的效率加成（>1 更高效）
             'forklift_eff': {'forklift_only': 2.0, 'heavy': 1.8, 'medium': 1.2, 'light': 1.1},
             # 普通型的效率（forklift_only 不可行 -> 0）
             'regular_eff': {'forklift_only': 0.0, 'heavy': 1.0, 'medium': 1.0, 'light': 1.0},
             # 区域均衡
-            'zone_balance_bonus': 0.3,
+            'zone_balance_bonus': 2.0,        # ← 翻倍 (原 1.0)
+            # ⭐ NEW: 任务价值奖励系数 - 鼓励完成高价值任务
+            'task_value_reward_scale': 0.1,   # 任务价值 × 0.1 = 额外奖励
+            # 例如: 价值200的任务 → 额外奖励20
+            #      价值50的任务 → 额外奖励5
         }
 
         # 初始化布局与统计
@@ -421,6 +435,7 @@ class DynamicWarehouseEnv:
             'medium': 0,
             'light': 0,
         }
+        self.total_tasks_requeued = 0
 
     # 重置环境
     def reset(self) -> np.ndarray:
@@ -585,6 +600,7 @@ class DynamicWarehouseEnv:
             'orders_completed': [],
             # 不再使用 nest 概念
             'late_tasks': [],
+            'tasks_requeued': [],
         }
         # 先执行外部控制 hook（策略可动态调参）
         if self.control_hook is not None:
@@ -622,6 +638,8 @@ class DynamicWarehouseEnv:
             rewards[pid] = rew
             if picker.current_task is not None:
                 self.picker_utilization[pid] += 1
+        # 卡死检测：必要时释放长时间无进展的任务
+        self._resolve_stuck_pickers(info)
         # 截止期检查、充电
         self._check_deadlines(info)
         self._update_charging()
@@ -719,6 +737,7 @@ class DynamicWarehouseEnv:
             picker.total_distance += moved_cells
             if picker.current_task:
                 reward += self._calculate_movement_reward(picker, old_x, old_y)
+                picker.last_progress_step = self.current_step
         # 电池消耗按移动单元数叠加
         if moved_cells > 0:
             picker.battery -= 0.1 * moved_cells
@@ -727,14 +746,54 @@ class DynamicWarehouseEnv:
         if picker.battery < 20:
             reward += self.reward_config['battery_low_penalty']
 
-        # VARIANT-1: 拥堵指数惩罚（0-3级）
+        # VARIANT-1: 拥堵指数惩罚（0-3级）- 使用 reward_config
         congestion_level = self._check_congestion(picker)
         if congestion_level > 0:
-            # 指数惩罚：level 1=-2, level 2=-5, level 3=-10
-            congestion_penalties = {0: 0, 1: -2.0, 2: -5.0, 3: -10.0}
-            reward += congestion_penalties.get(congestion_level, 0)
+            # 使用 reward_config 中的 congestion_penalty 基础值,按级别指数放大
+            base_cong_penalty = self.reward_config.get('congestion_penalty', -0.05)
+            # level 1=1x, level 2=2x, level 3=4x (指数增长但使用config值)
+            multipliers = {0: 0, 1: 1.0, 2: 2.0, 3: 4.0}
+            reward += base_cong_penalty * multipliers.get(congestion_level, 1.0)
 
         return reward
+
+    def _resolve_stuck_pickers(self, info: Dict):
+        """释放长时间无进展的拣货员任务，避免通道永久堵塞。"""
+        threshold = max(0, int(getattr(self, 'stuck_release_steps', 0)))
+        if threshold <= 0:
+            return
+        for picker in self.pickers:
+            task = picker.current_task
+            if task is None:
+                picker._tracked_task_id = None
+                continue
+            task_id = getattr(task, 'task_id', None)
+            if picker._tracked_task_id != task_id:
+                picker._tracked_task_id = task_id
+                picker.last_progress_step = self.current_step
+                task.assigned_time = self.current_time
+            stuck_steps = self.current_step - picker.last_progress_step
+            if stuck_steps >= threshold:
+                self._release_stuck_task(picker, info)
+
+    def _release_stuck_task(self, picker: Picker, info: Dict):
+        """将卡死状态的任务重新放回任务池，供其他拣货员接手。"""
+        task = picker.current_task
+        if task is None:
+            return
+        task.status = TaskStatus.PENDING
+        task.assigned_picker = None
+        task.start_time = None
+        task.assigned_time = None
+        picker.current_task = None
+        picker.carrying_items = []
+        picker._tracked_task_id = None
+        picker.last_progress_step = self.current_step
+        self.total_tasks_requeued += 1
+        info['tasks_requeued'].append(task.task_id)
+        penalty = float(getattr(self, 'stuck_release_penalty', 0.0))
+        if penalty < 0:
+            self.total_value_penalty += abs(penalty)
 
     # === 价值衰减相关工具 ===
     def get_task_decayed_value(self, task: Task, at_time: Optional[float] = None) -> int:
@@ -884,6 +943,7 @@ class DynamicWarehouseEnv:
             picker.carrying_items = t.items
             t.status = TaskStatus.IN_PROGRESS
             reward += pick_reward
+            picker.last_progress_step = self.current_step
         # 送货（在站点相邻）
         elif picker.carrying_items and t.station_id is not None and t.station_id < len(self.stations):
             st = self.stations[t.station_id]
@@ -893,6 +953,7 @@ class DynamicWarehouseEnv:
                 eff = self.reward_config['forklift_eff' if picker.type == PickerType.FORKLIFT else 'regular_eff'][t.weight_class]
                 eff_pd = self._compute_pickdrop_efficiency(picker, t)
                 drop_reward = base * eff * eff_pd
+                drop_reward += float(self.reward_config.get('drop_completion_bonus', 0.0))
                 picker.carrying_items = []
                 t.status = TaskStatus.COMPLETED
                 t.completion_time = self.current_time
@@ -920,9 +981,20 @@ class DynamicWarehouseEnv:
                 else:
                     drop_reward += self.reward_config['late_penalty']
                     info['late_tasks'].append(t.task_id)
+
+                # ⭐ NEW: 加入任务价值奖励 - 鼓励完成高价值任务
+                try:
+                    task_value = float(getattr(t, 'base_value', 0))
+                    value_reward_scale = float(self.reward_config.get('task_value_reward_scale', 0.0))
+                    if value_reward_scale > 0 and task_value > 0:
+                        value_bonus = task_value * value_reward_scale
+                        drop_reward += value_bonus
+                except Exception:
+                    pass
                 reward += drop_reward
                 info['tasks_completed'].append(t.task_id)
                 picker.current_task = None
+                picker.last_progress_step = self.current_step
         return reward
 
     def _calculate_movement_reward(self, picker: Picker, old_x: int, old_y: int) -> float:
@@ -988,6 +1060,35 @@ class DynamicWarehouseEnv:
                     best = (nx, ny)
         return best
 
+    def estimate_completion_time(self, picker: Picker, task: Task) -> float:
+        """估算从当前状态完成任务所需时间（小时），用于派单前可达性判断。"""
+        try:
+            base_speed_cfg = self.speed_config.get('base_speed', {})
+            avg_speed = float(base_speed_cfg.get('forklift' if picker.type == PickerType.FORKLIFT else 'regular', 1.0))
+        except Exception:
+            avg_speed = 1.0
+        avg_speed = max(0.3, avg_speed)
+
+        if task.shelf_id is None or task.shelf_id >= len(self.shelves):
+            return float('inf')
+        shelf = self.shelves[task.shelf_id]
+        shelf_adj = self._nearest_adjacent_accessible((shelf['x'], shelf['y']), (picker.x, picker.y))
+        if shelf_adj is None:
+            shelf_adj = (shelf['x'], shelf['y'])
+        dist_to_shelf = self._aisle_distance((picker.x, picker.y), shelf_adj)
+
+        if task.station_id is None or task.station_id >= len(self.stations):
+            return float('inf')
+        station = self.stations[task.station_id]
+        dist_to_station = self._aisle_distance(shelf_adj, (station['x'], station['y']))
+
+        total_cells = max(0, dist_to_shelf) + max(0, dist_to_station)
+        move_steps = total_cells / avg_speed
+        # 额外留出 pick/drop 与可能的等待缓冲
+        buffer_steps = 4.0
+        total_steps = move_steps + buffer_steps
+        return total_steps * (self.time_step / 3600.0)
+
     def _check_deadlines(self, info: Dict):
         """标记超过截止时间但未完成的任务（记录在 info['late_tasks']）"""
         # 过期标记与超期销毁
@@ -1033,11 +1134,10 @@ class DynamicWarehouseEnv:
                 self.task_pool.remove(t)
         except Exception:
             pass
-        # 统计罚没
+        # 统计罚没：仅累计 penalty，不再扣除已完成价值
         try:
             base_val = int(getattr(t, 'base_value', 0))
             pen = max(0, base_val)
-            self.total_value_completed -= pen
             self.total_value_penalty += pen
         except Exception:
             pass

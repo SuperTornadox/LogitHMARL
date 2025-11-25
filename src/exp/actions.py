@@ -29,58 +29,92 @@ def convert_to_dynamic_actions(actions, env=None, input_space: str = 'env'):
 
 
 def smart_navigate(picker, target_pos, env):
-    """基于通道最短路的贪心导航：
-    - 计算当前位置与目标在通道上的BFS距离，选择能降低该距离的方向。
-    - 屏蔽货架格（env.grid==2）。
+    """使用BFS的一步导航：找到最短路径的第一步。
+
+    使用简化BFS(限制搜索深度)找到最短路径,返回第一步的方向。
+    为避免过慢,限制BFS搜索范围。
+
     返回: action_int（0..3=UP/DOWN/LEFT/RIGHT，4=IDLE）
     """
-    dx = target_pos[0] - picker.x
-    dy = target_pos[1] - picker.y
-    if dx == 0 and dy == 0:
-        return 4  # 已在目标位置附近 → IDLE
+    from collections import deque
 
-    possible = []
-    # 环境动作: 0=UP,1=DOWN,2=LEFT,3=RIGHT,4=IDLE
-    dirs = [
-        (0, 0, -1),  # UP
-        (1, 0, 1),   # DOWN
-        (2, -1, 0),  # LEFT
-        (3, 1, 0),   # RIGHT
-    ]
-    # 仅基于静态障碍（货架）计算BFS距离
-    cur_dist = aisle_distance(env, (picker.x, picker.y), target_pos)
-    last_dir = getattr(picker, 'last_dir', None)
-    opposite = {0:1, 1:0, 2:3, 3:2}
-    for action, ddx, ddy in dirs:
-        nx, ny = picker.x + ddx, picker.y + ddy
-        if not (0 <= nx < env.width and 0 <= ny < env.height):
-            continue
-        # 货架格不走
-        if env.grid[ny, nx] == 2:
-            continue
-        # 计算经通道到目标的BFS距离
-        new_dist = aisle_distance(env, (nx, ny), target_pos)
-        if new_dist < cur_dist:
-            pri = 0
-        elif new_dist == cur_dist:
-            pri = 1
-        else:
-            pri = 2
-        # 增加反摆动偏好：
-        # - 与上一步相同方向优先（tie-break 更小）
-        # - 与上一步相反方向劣后（tie-break 更大）
-        tie = 1
-        if last_dir is not None:
-            if action == last_dir:
-                tie = 0
-            elif action == opposite.get(last_dir):
-                tie = 2
-        possible.append((pri, new_dist, tie, action))
+    start = (picker.x, picker.y)
+    goal = target_pos
 
-    if possible:
-        possible.sort(key=lambda x: (x[0], x[1], x[2]))
-        return possible[0][3]
-    return 4  # 无法更近 → IDLE
+    if start == goal:
+        return 4  # 已到达
+
+    # BFS查找最短路径(限制深度避免太慢)
+    queue = deque([(start, [])])  # (位置, 路径)
+    visited = {start}
+    max_depth = 50  # 限制搜索深度
+
+    while queue:
+        (x, y), path = queue.popleft()
+
+        # 限制搜索深度
+        if len(path) > max_depth:
+            break
+
+        # 尝试4个方向
+        for action, (dx, dy) in [(0, (0, -1)), (1, (0, 1)), (2, (-1, 0)), (3, (1, 0))]:
+            nx, ny = x + dx, y + dy
+
+            # 边界和货架检查
+            if not (0 <= nx < env.width and 0 <= ny < env.height):
+                continue
+            if env.grid[ny, nx] == 2:  # 货架
+                continue
+            if (nx, ny) in visited:
+                continue
+
+            new_path = path + [action]
+            visited.add((nx, ny))
+
+            # 找到目标
+            if (nx, ny) == goal:
+                # 返回路径的第一步
+                return new_path[0] if new_path else 4
+
+            queue.append(((nx, ny), new_path))
+
+    # 无法找到路径,尝试朝目标靠近(降级方案)
+    dx = goal[0] - start[0]
+    dy = goal[1] - start[1]
+
+    def can_move_to(x, y):
+        if not (0 <= x < env.width and 0 <= y < env.height):
+            return False
+        return env.grid[y, x] != 2
+
+    # 尝试主方向
+    candidates = []
+    if abs(dx) > abs(dy):
+        if dx > 0 and can_move_to(start[0] + 1, start[1]):
+            candidates.append(3)  # RIGHT
+        elif dx < 0 and can_move_to(start[0] - 1, start[1]):
+            candidates.append(2)  # LEFT
+        if dy > 0 and can_move_to(start[0], start[1] + 1):
+            candidates.append(1)  # DOWN
+        elif dy < 0 and can_move_to(start[0], start[1] - 1):
+            candidates.append(0)  # UP
+    else:
+        if dy > 0 and can_move_to(start[0], start[1] + 1):
+            candidates.append(1)  # DOWN
+        elif dy < 0 and can_move_to(start[0], start[1] - 1):
+            candidates.append(0)  # UP
+        if dx > 0 and can_move_to(start[0] + 1, start[1]):
+            candidates.append(3)  # RIGHT
+        elif dx < 0 and can_move_to(start[0] - 1, start[1]):
+            candidates.append(2)  # LEFT
+
+    # 尝试任意可行方向
+    if not candidates:
+        for action, (ddx, ddy) in [(0, (0, -1)), (1, (0, 1)), (2, (-1, 0)), (3, (1, 0))]:
+            if can_move_to(start[0] + ddx, start[1] + ddy):
+                candidates.append(action)
+
+    return candidates[0] if candidates else 4
 
 
 def find_adjacent_accessible_position(env, shelf_pos, picker_pos):

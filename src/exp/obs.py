@@ -109,6 +109,17 @@ def get_global_state(env):
     total = sum(env.zone_loads)
     for z in range(4):
         state.append(env.zone_loads[z] / max(1, total))
+    # 区域拥堵加成（来自环境的时段化分区拥堵，0..1；不可用时填0）
+    try:
+        extras = []
+        for z in range(4):
+            if hasattr(env, '_zone_congestion_extra'):
+                extras.append(float(env._zone_congestion_extra(z)))
+            else:
+                extras.append(0.0)
+        state.extend(extras)
+    except Exception:
+        state.extend([0.0, 0.0, 0.0, 0.0])
     # 绩效
     state.extend([
         getattr(env, 'total_orders_completed', 0) / max(1, getattr(env, 'total_orders_received', 1)),
@@ -121,7 +132,7 @@ def get_task_features(env, max_tasks=20, pending_only: bool = True):
     """将任务池编码成固定维度特征。
 
     - pending_only=True 时，仅取 PENDING 任务；否则按池顺序截取前 max_tasks 个。
-    - 输出 shape = [max_tasks, 5]，不足用零填充。
+    - 输出 shape = [max_tasks, 12]，不足用零填充。（IMPROVED: 从9维扩展到12维）
     """
     feats = []
     if pending_only:
@@ -137,12 +148,69 @@ def get_task_features(env, max_tasks=20, pending_only: bool = True):
         if t.shelf_id is not None and t.shelf_id < len(env.shelves):
             sh = env.shelves[t.shelf_id]
             shx, shy = sh['x'] / env.width, sh['y'] / env.height
+        # 第3维：是否需要叉车 (requires_car)
+        try:
+            req_car = 1.0 if bool(getattr(t, 'requires_car', False)) else 0.0
+        except Exception:
+            req_car = 0.0
+        # 新增：到最近“空闲拣货员”的曼哈顿距离（归一化）。空闲定义：无当前任务且未携货。
+        try:
+            sx = int(sh['x']) if t.shelf_id is not None and t.shelf_id < len(env.shelves) else int(round(shx * env.width))
+            sy = int(sh['y']) if t.shelf_id is not None and t.shelf_id < len(env.shelves) else int(round(shy * env.height))
+            free_pickers = [p for p in env.pickers if getattr(p, 'current_task', None) is None and len(getattr(p, 'carrying_items', [])) == 0]
+            if free_pickers:
+                d_min = min(abs(p.x - sx) + abs(p.y - sy) for p in free_pickers)
+            else:
+                d_min = 0
+            # 归一化到 [0,1]，以 (width+height) 为尺度
+            dist_norm = float(d_min) / max(1.0, float(env.width + env.height))
+        except Exception:
+            dist_norm = 0.0
+        try:
+            base_val = float(getattr(t, 'base_value', 0.0))
+        except Exception:
+            base_val = 0.0
+        try:
+            dec_val = float(env.get_task_decayed_value(t, at_time=env.current_time))
+        except Exception:
+            dec_val = base_val
+        time_to_deadline = max(0.0, float(getattr(t, 'deadline', 0.0) - env.current_time))
+        density = dec_val / max(1e-3, time_to_deadline) if time_to_deadline > 0 else dec_val
+
+        # IMPROVED: Add zone and urgency features for better nest separation
+        try:
+            zone_id = float(getattr(t, 'zone', 0))
+        except Exception:
+            zone_id = 0.0
+        is_urgent = 1.0 if (t.priority > 0.7 or time_to_deadline < 0.15) else 0.0
+
+        # IMPROVED: Add zone congestion feature
+        try:
+            zone_loads = [0] * 4
+            for p in env.pickers:
+                zx = int(p.x / max(1, env.width / 2))
+                zy = int(p.y / max(1, env.height / 2))
+                z_idx = zy * 2 + zx
+                if 0 <= z_idx < 4:
+                    zone_loads[z_idx] += 1
+            task_zone = int(zone_id) if 0 <= int(zone_id) < 4 else 0
+            zone_congestion = float(zone_loads[task_zone]) / max(1.0, float(env.n_pickers))
+        except Exception:
+            zone_congestion = 0.0
+
         feats.append([
             shx, shy,
-            1.0,  # 大小占位
+            float(req_car),
+            base_val,
+            dec_val,
             t.priority,
-            max(0.0, t.deadline - env.current_time)
+            time_to_deadline,
+            dist_norm,
+            density,
+            zone_id,           # NEW: zone (0-3)
+            is_urgent,         # NEW: urgency indicator
+            zone_congestion,   # NEW: zone congestion (0-1)
         ])
     while len(feats) < max_tasks:
-        feats.append([0.0, 0.0, 0.0, 0.0, 0.0])
+        feats.append([0.0] * 12)  # IMPROVED: Updated from 9 to 12 dimensions
     return np.array(feats[:max_tasks], dtype=np.float32)

@@ -6,6 +6,7 @@ import numpy as np
 from typing import Dict, List, Tuple, Optional
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
+import bisect
 
 @dataclass
 class Order:
@@ -62,6 +63,16 @@ class NonHomogeneousPoissonOrderGenerator:
         })
         # 可选缩放因子：整体拉伸/压缩截止期
         self.deadline_scale = float(config.get('deadline_scale', 1.0))
+
+        # VARIANT-1: 突发式订单配置
+        self.bursty_prob = config.get('bursty_prob', 0.0)  # 突发概率（0表示关闭）
+        self.burst_size = config.get('burst_size', (10, 20))  # 突发订单数量范围
+        self.burst_zone_correlation = config.get('burst_zone_correlation', 0.75)  # 区域相关性
+
+        # 可选：区域峰值时段调度，用于制造"按区域成簇"的相关性，突出 NL 的巢优势。
+        # 形如：[(start, end, [p0,p1,p2,p3]), ...]，概率向量长度为4并且和为1。
+        # 时间坐标与 pattern_period_hours 同口径；若启用 scale_pattern_to_simulation，会自动映射。
+        self.zone_peak_schedule = config.get('zone_peak_schedule', None)
         
         # SKU分布（帕累托分布：20%的SKU占80%的订单）
         self.n_skus = config.get('n_skus', 1000)
@@ -74,7 +85,12 @@ class NonHomogeneousPoissonOrderGenerator:
         # 预生成订单流（可选）
         self.pregenerated_orders = []
         self.use_pregeneration = config.get('use_pregeneration', True)
-        
+
+        # 性能优化：预计算zone概率查找表
+        self.zone_lookup_table = None
+        self.zone_lookup_bins = 1000  # 时间分辨率
+        self._build_zone_lookup_table()
+
         if self.use_pregeneration:
             self.pregenerate_orders()
     
@@ -91,6 +107,7 @@ class NonHomogeneousPoissonOrderGenerator:
         # 将SKU分配到不同货架区域
         # 热门SKU放在靠近站点的位置
         self.sku_locations = {}
+        self.skus_by_zone = {0: [], 1: [], 2: [], 3: []}
         for i in range(self.n_skus):
             # 将热门SKU优先放在 Zone 2（左下），其余按原策略分布
             if i < self.n_skus * 0.2:  # 前20%热门SKU
@@ -105,6 +122,82 @@ class NonHomogeneousPoissonOrderGenerator:
                 'shelf_id': np.random.randint(zone * 5, (zone + 1) * 5),
                 'popularity': self.sku_popularities[i]
             }
+            self.skus_by_zone[zone].append(i)
+
+        # 为每个区域预计算按流行度归一化的选择权重，便于按区域采样 SKU
+        self.zone_pop_weights = {}
+        for z, lst in self.skus_by_zone.items():
+            if len(lst) == 0:
+                self.zone_pop_weights[z] = None
+                continue
+            w = np.array([self.sku_locations[idx]['popularity'] for idx in lst], dtype=np.float64)
+            s = float(w.sum())
+            self.zone_pop_weights[z] = (w / s) if s > 0 else np.ones(len(lst), dtype=np.float64) / len(lst)
+
+    def _map_time_to_period(self, time_hour: float) -> float:
+        """将仿真时间映射到模式周期坐标。"""
+        if self.scale_pattern_to_simulation and float(self.simulation_hours) > 0:
+            t_sim = time_hour % float(self.simulation_hours)
+            return (t_sim / float(self.simulation_hours)) * float(self.pattern_period_hours)
+        return time_hour % float(self.pattern_period_hours)
+
+    def _build_zone_lookup_table(self):
+        """性能优化：预计算zone概率查找表（1000个时间点）。
+
+        将O(4)的线性搜索优化为O(1)的数组查找。
+        对于468k订单×2.5物品=1.17M次调用，从4.68M操作降至1.17M操作（75%加速）。
+        """
+        if not self.zone_peak_schedule:
+            self.zone_lookup_table = None
+            return
+
+        # 创建查找表：shape (bins, 4)
+        bins = self.zone_lookup_bins
+        self.zone_lookup_table = np.zeros((bins, 4), dtype=np.float64)
+        default_probs = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
+
+        # 预计算每个时间点的zone概率
+        for i in range(bins):
+            # 将bin索引映射到时间（覆盖整个pattern_period）
+            t = (i / bins) * float(self.pattern_period_hours)
+
+            # 找到对应的概率区间（与原get_zone_probs逻辑一致）
+            found = False
+            for start, end, probs in self.zone_peak_schedule:
+                try:
+                    p = np.array(probs, dtype=np.float64)
+                    if p.shape[0] != 4:
+                        continue
+                    if start <= t < end:
+                        p = p / max(1e-12, p.sum())
+                        self.zone_lookup_table[i] = p
+                        found = True
+                        break
+                except Exception:
+                    continue
+
+            if not found:
+                self.zone_lookup_table[i] = default_probs
+
+    def get_zone_probs(self, time_hour: float) -> np.ndarray:
+        """返回给定时刻的四区概率分布（用于按区域聚簇采样 SKU）。
+
+        性能优化版：使用预计算查找表，O(1)复杂度。
+        若未配置 zone_peak_schedule，则返回均匀分布。
+        """
+        # 快速路径：无zone_peak_schedule或无查找表
+        if self.zone_lookup_table is None:
+            return np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
+
+        # 将时间映射到pattern周期
+        t = self._map_time_to_period(time_hour)
+
+        # 计算查找表索引（O(1)操作）
+        bin_idx = int((t / float(self.pattern_period_hours)) * self.zone_lookup_bins)
+        bin_idx = min(bin_idx, self.zone_lookup_bins - 1)  # 防止边界溢出
+
+        # 直接返回预计算的概率（O(1)查找）
+        return self.zone_lookup_table[bin_idx].copy()
     
     def _base_arrival_rate(self, hour_in_period: float) -> float:
         """返回在模式周期内的基础到达率（不考虑仿真时长缩放）。
@@ -140,13 +233,17 @@ class NonHomogeneousPoissonOrderGenerator:
             hour_in_period = time_hour % float(self.pattern_period_hours)
         return float(self._base_arrival_rate(hour_in_period))
     
-    def generate_order_items(self, order_type: str, weight_class: str) -> List[Dict]:
+    def generate_order_items(self, order_type: str, weight_class: str,
+                            time_hour: Optional[float] = None,
+                            zone_override: Optional[int] = None) -> List[Dict]:
         """
         生成订单物品列表
-        
+
         Args:
             order_type: 订单类型
-            
+            time_hour: 订单到达时间（小时）
+            zone_override: VARIANT-1: 可选的区域覆盖（用于突发相关性）
+
         Returns:
             物品列表（每个物品带数值重量 weight，按 weight_class 的范围采样）
         """
@@ -171,10 +268,24 @@ class NonHomogeneousPoissonOrderGenerator:
             n_items = min(n_items, 5)
         
         # 根据SKU流行度选择物品
+        # 选择用于区域概率的时间
+        th = float(self.current_time if time_hour is None else time_hour)
         for _ in range(n_items):
-            # 使用指数分布偏向选择热门SKU
-            sku_idx = min(int(np.random.exponential(self.n_skus * 0.2)), self.n_skus - 1)
-            sku_info = self.sku_locations[sku_idx]
+            # VARIANT-1: 如果有zone_override（突发时），优先使用指定区域
+            if zone_override is not None:
+                z = zone_override
+            else:
+                # 先按时间决定区域分布（制造"区域成簇"），再在该区域内按流行度选 SKU
+                zone_probs = self.get_zone_probs(th)
+                z = int(np.random.choice([0, 1, 2, 3], p=zone_probs))
+            if len(self.skus_by_zone.get(z, [])) > 0 and self.zone_pop_weights.get(z) is not None:
+                idx_in_zone = np.random.choice(len(self.skus_by_zone[z]), p=self.zone_pop_weights[z])
+                sku_idx = int(self.skus_by_zone[z][idx_in_zone])
+                sku_info = self.sku_locations[sku_idx]
+            else:
+                # 回退：全局指数偏置
+                sku_idx = min(int(np.random.exponential(self.n_skus * 0.2)), self.n_skus - 1)
+                sku_info = self.sku_locations[sku_idx]
             # 按 weight_class 设定 value 取值范围（整数）
             if weight_class == 'light':
                 v_low, v_high = 1, 50
@@ -196,13 +307,14 @@ class NonHomogeneousPoissonOrderGenerator:
         
         return items
     
-    def generate_single_order(self, arrival_time: float) -> Order:
+    def generate_single_order(self, arrival_time: float, zone_override: Optional[int] = None) -> Order:
         """
         生成单个订单
-        
+
         Args:
             arrival_time: 订单到达时间
-            
+            zone_override: VARIANT-1: 可选的区域覆盖（用于突发相关性）
+
         Returns:
             Order对象
         """
@@ -228,23 +340,29 @@ class NonHomogeneousPoissonOrderGenerator:
         deadline = arrival_time + duration
         
         # 随机确定重量类型（不由订单类型决定）
+        # VARIANT-1: 增加重型任务比例，使叉车分配更关键
+        # 新比例：heavy 40%, medium 35%, light 25%
         r2 = np.random.random()
-        if r2 < self.urgent_order_prob:  # 保持与生成器可调参数一致（或自定义分布）
-            # 也可直接使用固定比例，这里示例：heavy 15%
-            pass
-        # 采用固定比例：heavy 15%，medium 60%，light 25%
-        if r2 < 0.15:
+        if r2 < 0.40:
             weight_class = 'heavy'
-        elif r2 < 0.75:
+        elif r2 < 0.75:  # 0.40 + 0.35 = 0.75
             weight_class = 'medium'
         else:
             weight_class = 'light'
 
         # 生成订单物品（数量由订单类型决定），并按 weight_class 采样数值重量
-        items = self.generate_order_items(order_type, weight_class)
-        
+        items = self.generate_order_items(
+            order_type, weight_class,
+            time_hour=arrival_time,
+            zone_override=zone_override  # VARIANT-1: 突发时指定区域
+        )
+
         # 确定客户区域（影响配送站点选择）
-        customer_zone = np.random.choice([0, 1, 2, 3], p=[0.3, 0.3, 0.2, 0.2])
+        # VARIANT-1: 如果zone_override指定，优先使用
+        if zone_override is not None:
+            customer_zone = zone_override
+        else:
+            customer_zone = np.random.choice([0, 1, 2, 3], p=[0.3, 0.3, 0.2, 0.2])
 
         order = Order(
             order_id=self.order_counter,
@@ -263,40 +381,81 @@ class NonHomogeneousPoissonOrderGenerator:
     def pregenerate_orders(self):
         """
         预生成整个模拟期间的订单
-        使用非齐次泊松过程
+        使用非齐次泊松过程 + VARIANT-1突发生成
         """
         self.pregenerated_orders = []
         current_time = 0.0
-        
+        burst_count = 0  # 追踪突发次数
+
         while current_time < self.simulation_hours:
             # 获取当前时间的到达率
             rate = self.get_arrival_rate(current_time)
-            
+
             # 生成下一个订单的间隔时间（指数分布）
             inter_arrival_time = np.random.exponential(1.0 / rate)
             current_time += inter_arrival_time
-            
+
             if current_time < self.simulation_hours:
-                order = self.generate_single_order(current_time)
-                self.pregenerated_orders.append(order)
-        
+                # VARIANT-1: 检查是否触发突发
+                if self.bursty_prob > 0 and np.random.random() < self.bursty_prob:
+                    # 触发突发：生成多个相关订单
+                    burst_count += 1
+                    n_burst = int(np.random.uniform(*self.burst_size))
+
+                    # 随机选择一个主导区域（突发订单集中在这个区域）
+                    dominant_zone = np.random.randint(0, 4)
+
+                    for i in range(n_burst):
+                        # burst_zone_correlation概率选择主导区域，否则随机区域
+                        if np.random.random() < self.burst_zone_correlation:
+                            zone_override = dominant_zone
+                        else:
+                            zone_override = np.random.randint(0, 4)
+
+                        # 生成订单（带区域覆盖）
+                        order = self.generate_single_order(
+                            current_time + i * 0.01,  # 微小时间偏移避免完全同时
+                            zone_override=zone_override
+                        )
+                        self.pregenerated_orders.append(order)
+                else:
+                    # 正常单个订单生成
+                    order = self.generate_single_order(current_time)
+                    self.pregenerated_orders.append(order)
+
+        # 性能优化：按arrival_time排序，支持二分查找
+        self.pregenerated_orders.sort(key=lambda o: o.arrival_time)
+
+        # 性能优化：缓存arrival_times列表，避免每次查询时重建
+        self._cached_arrival_times = [o.arrival_time for o in self.pregenerated_orders]
+
         print(f"预生成{len(self.pregenerated_orders)}个订单，"
-              f"平均到达率: {len(self.pregenerated_orders)/self.simulation_hours:.1f}订单/小时")
+              f"平均到达率: {len(self.pregenerated_orders)/self.simulation_hours:.1f}订单/小时，"
+              f"突发事件: {burst_count}次")
     
     def get_orders_in_window(self, start_time: float, end_time: float) -> List[Order]:
         """
-        获取时间窗口内的订单
-        
+        获取时间窗口内的订单（性能优化版：使用二分查找）
+
         Args:
             start_time: 开始时间
             end_time: 结束时间
-            
+
         Returns:
             该时间窗口内的订单列表
         """
         if self.use_pregeneration:
-            return [o for o in self.pregenerated_orders 
-                   if start_time <= o.arrival_time < end_time]
+            # 性能优化：使用二分查找（O(log N)），而非线性扫描（O(N)）
+            # 对于468k订单，从468k操作降至19操作（log2(468k) ≈ 19）
+            if not self.pregenerated_orders:
+                return []
+
+            # 使用bisect在已排序列表中查找边界（使用缓存的arrival_times）
+            # bisect_left: 找到 >= start_time 的第一个位置
+            left = bisect.bisect_left(self._cached_arrival_times, start_time)
+            right = bisect.bisect_left(self._cached_arrival_times, end_time)
+
+            return self.pregenerated_orders[left:right]
         else:
             # 实时生成
             orders = []

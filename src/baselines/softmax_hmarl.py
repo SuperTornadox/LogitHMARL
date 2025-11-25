@@ -3,13 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import Dict, List, Tuple, Optional
+from models.worker_policy import MultiAgentWorkerPolicy
 
 class SoftmaxManager(nn.Module):
     def __init__(self,
                  state_dim: int,
                  n_tasks: int,
                  hidden_dim: int = 256,
-                 embed_dim: int = 128):
+                 embed_dim: int = 128,
+                 task_feature_dim: int = 6):
         super().__init__()
         
         self.n_tasks = n_tasks
@@ -24,7 +26,7 @@ class SoftmaxManager(nn.Module):
         )
         
         # Task embedding network
-        self.task_embedder = nn.Linear(5, embed_dim)  # 5 task features
+        self.task_embedder = nn.Linear(task_feature_dim, embed_dim)
         
         # Global encoder
         self.global_encoder = nn.Sequential(
@@ -77,21 +79,34 @@ class SoftmaxManager(nn.Module):
     def select_task(self, state: torch.Tensor, task_features: torch.Tensor,
                    task_mask: Optional[torch.Tensor] = None,
                    deterministic: bool = False) -> Tuple[torch.Tensor, Dict]:
-        
         outputs = self.forward(state, task_features, task_mask)
-        
+        probs = outputs['task_probs']  # [B,T]
+        # Sanitize: remove NaN/Inf/negatives; mask invalid; renormalize; uniform fallback
+        probs = torch.nan_to_num(probs, nan=0.0, posinf=0.0, neginf=0.0)
+        probs = torch.clamp(probs, min=0.0)
+        if task_mask is not None:
+            probs = probs * task_mask.float()
+        sums = probs.sum(dim=1, keepdim=True)
+        zero_rows = (sums <= 1e-12).squeeze(1)
+        if zero_rows.any():
+            if task_mask is not None:
+                valid_counts = task_mask.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+                uniform = (task_mask.float() / valid_counts)
+            else:
+                T = probs.shape[1]
+                uniform = torch.full_like(probs, 1.0 / max(1, T))
+            probs[zero_rows] = uniform[zero_rows]
+            sums = probs.sum(dim=1, keepdim=True)
+        probs = probs / sums.clamp(min=1e-12)
+
         if deterministic:
-            # Select task with highest probability
-            task_indices = outputs['task_probs'].argmax(dim=1)
+            task_indices = probs.argmax(dim=1)
         else:
-            # Sample from distribution
-            task_indices = torch.multinomial(outputs['task_probs'], num_samples=1).squeeze(1)
-            
+            task_indices = torch.multinomial(torch.clamp(probs, min=1e-8), num_samples=1).squeeze(1)
         info = {
-            'task_probs': outputs['task_probs'],
+            'task_probs': probs,
             'utilities': outputs['task_utilities']
         }
-        
         return task_indices, info
         
     def compute_entropy(self, task_probs: torch.Tensor) -> torch.Tensor:
@@ -106,16 +121,20 @@ class SoftmaxHMARL:
                  worker_obs_dim: int,
                  worker_action_dim: int,
                  hidden_dim: int = 256,
-                 device: str = 'cpu'):
+                 device: str = 'cpu',
+                 task_feature_dim: int = 6):
         
         self.device = torch.device(device)
         self.n_agents = n_agents
+        self.n_tasks = n_tasks
         
         # Manager (categorical softmax instead of nested logit)
         self.manager = SoftmaxManager(
             state_dim=state_dim,
             n_tasks=n_tasks,
-            hidden_dim=hidden_dim
+            hidden_dim=hidden_dim,
+            embed_dim=128,
+            task_feature_dim=task_feature_dim
         ).to(self.device)
         
         # Workers (same as NL-HMARL)
@@ -186,9 +205,9 @@ class SoftmaxHMARL:
         log_probs = torch.log(outputs['task_probs'] + 1e-8)
         selected_log_probs = log_probs.gather(1, selected_tasks.unsqueeze(1)).squeeze(1)
         policy_loss = -(advantages * selected_log_probs).mean()
-        
-        # Value loss
-        value_loss = F.mse_loss(outputs['value'], returns)
+
+        # Value loss - FIXED: Use Huber loss for stability
+        value_loss = F.huber_loss(outputs['value'], returns, delta=10.0)
         
         # Entropy regularization
         entropy = self.manager.compute_entropy(outputs['task_probs'])

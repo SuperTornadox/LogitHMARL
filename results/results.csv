@@ -1,0 +1,6 @@
+method,raw_value,decayed_value,total_value,penalty,tasks_completed
+NL-HMARL,9351,9349,9347,2,162
+Softmax,10555,10527,10499,28,141
+Optimal,18809,18799,18789,10,228
+Return,35939,35939,35939,0,172
+S-Shape,34346,34346,34346,0,183
